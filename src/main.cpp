@@ -6,7 +6,7 @@
 // PIN CONFIG
 #define DHT_PIN 3
 #define DHT_TYPE DHT11
-#define SOIL_PIN 1
+#define SOIL_PIN 14
 #define SDA_PIN 8
 #define SCL_PIN 9
 #define RELAY_PIN 4
