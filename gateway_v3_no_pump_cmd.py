@@ -64,6 +64,12 @@ AI_CALL_INTERVAL_SEC = int(os.getenv("AI_CALL_INTERVAL_SEC", "3600"))  # seconds
 AI_LAT = float(os.getenv("AI_LAT", "10.7291"))
 AI_LON = float(os.getenv("AI_LON", "106.6984"))
 
+# How old (seconds) a manual Adafruit feed value may be and still be treated as a live
+# command against a gateway-controlled trigger (SCHEDULE / PROFILE / AI).
+# A stale OFF value (e.g. user pressed OFF yesterday) must not kill today's schedule.
+# Set to 0 to always apply every feed value regardless of age.
+MANUAL_FEED_STALE_SEC = int(os.getenv("MANUAL_FEED_STALE_SEC", "120"))
+
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 GMAIL_RECEIVER = os.getenv("GMAIL_RECEIVER", "")
@@ -490,6 +496,9 @@ class GatewayState:
         self.last_manual_feed_value: Optional[int] = None
         self.last_manual_command_at: float = 0.0
         self.pending_manual_state: Optional[int] = None
+        # Age (seconds) of the last successfully read Adafruit feed value.
+        # Initialized to infinity so startup never treats an old feed value as fresh.
+        self.last_manual_feed_age_sec: float = float("inf")
         # AI mode state
         self.last_ai_call_time: float = 0.0          # epoch of last successful AI API call
         self.ai_scheduled_start: Optional[float] = None   # epoch when AI wants pump to start
@@ -945,6 +954,17 @@ def poll_manual_command_from_feed() -> Optional[bool]:
         parsed = coerce_bool(raw)
         if parsed is None:
             return None
+        # Compute age of this feed value from its created_at timestamp so we can
+        # distinguish a live command from a stale historical value.
+        try:
+            created_at_str = getattr(pkt, "created_at", None)
+            if created_at_str:
+                created_dt = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
+                state.last_manual_feed_age_sec = now_ts - created_dt.timestamp()
+            else:
+                state.last_manual_feed_age_sec = 0.0  # no timestamp → treat as fresh
+        except Exception:
+            state.last_manual_feed_age_sec = 0.0
         state.last_manual_feed_value = 1 if parsed else 0
         return parsed
     except Exception:
@@ -1001,6 +1021,18 @@ def run_manual_logic():
         state.last_manual_feed_value = 1
         print("[MANUAL] Pump ON requested from web")
     elif (not desired) and state.pump_is_on:
+        # For gateway-controlled sessions (SCHEDULE / PROFILE / AI) only honour a
+        # manual OFF if the feed value is FRESH (user pressed it recently).
+        # A stale cached OFF (e.g. pressed yesterday) must not kill today's schedule.
+        # MANUAL sessions are always stoppable regardless of feed age.
+        feed_is_fresh = state.last_manual_feed_age_sec <= MANUAL_FEED_STALE_SEC
+        if state.active_trigger != "MANUAL" and not feed_is_fresh:
+            print(
+                f"[MANUAL] Ignoring stale OFF command "
+                f"(feed age={int(state.last_manual_feed_age_sec)}s > {MANUAL_FEED_STALE_SEC}s) "
+                f"while {state.active_trigger} is active"
+            )
+            return
         started_ts = state.current_watering_started_at
         stop_irrigation("manual command off", started_ts=started_ts, force=True)
         state.last_manual_command_at = time.time()
