@@ -2,6 +2,7 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
+#include <vector>
 
 // PIN CONFIG
 #define DHT_PIN 3
@@ -11,6 +12,20 @@
 #define SCL_PIN 9
 #define RELAY_PIN 4
 #define LED_BLINKY 20
+
+// Read intervals (ms)
+#define SOIL_READ_MS 500      // soil sensor read interval
+#define DHT_READ_MS 2000      // DHT sensor read interval (DHT11 min ~1s)
+#define MAIN_LOOP_READ_MS 50  // faster controller loop for quicker gateway/manual response
+// Keep LCD and serial telemetry print at a human-friendly rate
+#define TELEMETRY_PRINT_MS 1000
+#define LCD_UPDATE_MS 1000
+
+// Set to 1 if your relay module is active-LOW (drive LOW to energize relay).
+// Set to 0 if your relay module is active-HIGH (drive HIGH to energize relay).
+#ifndef RELAY_ACTIVE_LOW
+#define RELAY_ACTIVE_LOW 1
+#endif
 
 // INTERFACES
 class ISensor {
@@ -87,12 +102,13 @@ public:
 
   void update() override {
     long sum = 0;
-    for (int i = 0; i < 10; i++) {
+    const int samples = 5;
+    for (int i = 0; i < samples; i++) {
       sum += analogRead(pin);
-      delay(10);
+      delay(5);
     }
 
-    raw = sum / 10;
+    raw = sum / samples;
     percent = map(raw, dryValue, wetValue, 0, 100);
     percent = constrain(percent, 0, 100);
   }
@@ -149,13 +165,19 @@ public:
   }
 
   void on() {
-    digitalWrite(pin, LOW);   
+    digitalWrite(pin, RELAY_ACTIVE_LOW ? LOW : HIGH);
     state = true;
+    // debug: print actual pin level after commanding
+    Serial.print("Relay pin after ON: ");
+    Serial.println(digitalRead(pin) == HIGH ? "HIGH" : "LOW");
   }
 
   void off() {
-    digitalWrite(pin, HIGH);  
+    digitalWrite(pin, RELAY_ACTIVE_LOW ? HIGH : LOW);
     state = false;
+    // debug: print actual pin level after commanding
+    Serial.print("Relay pin after OFF: ");
+    Serial.println(digitalRead(pin) == HIGH ? "HIGH" : "LOW");
   }
 
   bool isOn() {
@@ -195,6 +217,35 @@ private:
   unsigned long lastBlinkTime = 0;
   const unsigned long blinkInterval = 300;
 
+  // sensor timers (ms)
+  unsigned long lastSoilMs = 0;
+  unsigned long lastDhtMs = 0;
+  unsigned long lastTelemetryMs = 0;
+  unsigned long lastLCDMs = 0;
+  unsigned long nowMs = 0;
+
+  
+  struct ScheduleEvent {
+    String id;
+    unsigned long start_ts; 
+    unsigned long duration_sec;
+    String zoneId;
+  };
+
+  std::vector<ScheduleEvent> scheduleEvents;
+  bool haveTime = false;
+  unsigned long timeEpochSecAtSet = 0; 
+  unsigned long lastMillisAtTimeSet = 0;
+  String deviceZoneId = "";
+  String currentActiveEventId = "";
+  unsigned long currentActiveStartEpoch = 0;
+
+  unsigned long currentEpochSec() {
+    if (!haveTime) return 0;
+    unsigned long delta = (millis() - lastMillisAtTimeSet) / 1000;
+    return timeEpochSecAtSet + delta;
+  }
+
 public:
   SystemController(
     DHTSensor *d,
@@ -225,6 +276,7 @@ public:
   void processSerialCommand(String cmd) {
     cmd.trim();
 
+    // Handle pump command
     if (cmd.startsWith("!CMD=PUMP;VALUE=") && cmd.endsWith("#")) {
       String value = cmd.substring(16, cmd.length() - 1);
 
@@ -235,6 +287,95 @@ public:
         remotePumpState = false;
         Serial.println("Remote pump -> OFF");
       }
+      return;
+    }
+
+    // Handle time sync: !TIME=<epoch># (epoch seconds)
+    if (cmd.startsWith("!TIME=") && cmd.endsWith("#")) {
+      String value = cmd.substring(6, cmd.length() - 1);
+      unsigned long epoch = (unsigned long) value.toInt();
+      if (epoch > 1000000000UL) {
+        timeEpochSecAtSet = epoch;
+        lastMillisAtTimeSet = millis();
+        haveTime = true;
+        Serial.print("Time synced: ");
+        Serial.println(epoch);
+      }
+      return;
+    }
+
+    // Handle absolute schedule event: !SCHEDABS;ZONE=...;ID=...;START_TS=...;DUR=...#
+    if (cmd.startsWith("!SCHEDABS;") && cmd.endsWith("#")) {
+      String body = cmd.substring(1, cmd.length() - 1); // remove leading ! and trailing #
+      // body format: SCHEDABS;ID=...;START_TS=...;DUR=...
+      int pos = 0;
+      int nextPos = body.indexOf(';', pos);
+      // skip header
+      if (nextPos > 0) pos = nextPos + 1;
+      String id = "";
+      String zone = "";
+      unsigned long start_ts = 0;
+      unsigned long dur = 0;
+      while (pos < (int)body.length()) {
+        nextPos = body.indexOf(';', pos);
+        String part;
+        if (nextPos == -1) {
+          part = body.substring(pos);
+          pos = body.length();
+        } else {
+          part = body.substring(pos, nextPos);
+          pos = nextPos + 1;
+        }
+        int eq = part.indexOf('=');
+        if (eq == -1) continue;
+        String k = part.substring(0, eq);
+        String v = part.substring(eq + 1);
+        if (k == "ID") id = v;
+        else if (k == "ZONE") zone = v;
+        else if (k == "START_TS") start_ts = (unsigned long)v.toInt();
+        else if (k == "DUR") dur = (unsigned long)v.toInt();
+      }
+
+      if (start_ts > 0 && dur > 0) {
+        ScheduleEvent ev;
+        ev.id = id;
+        ev.zoneId = zone;
+        ev.start_ts = start_ts;
+        ev.duration_sec = dur;
+        // replace existing with same id
+        bool replaced = false;
+        for (size_t i = 0; i < scheduleEvents.size(); i++) {
+          if (scheduleEvents[i].id == ev.id && scheduleEvents[i].zoneId == ev.zoneId) {
+            scheduleEvents[i] = ev;
+            replaced = true;
+            break;
+          }
+        }
+        if (!replaced) scheduleEvents.push_back(ev);
+        Serial.print("Received scheduled event: ");
+        Serial.print(ev.id);
+        if (ev.zoneId.length() > 0) {
+          Serial.print(" zone=");
+          Serial.print(ev.zoneId);
+        }
+        Serial.print(" start=");
+        Serial.print(ev.start_ts);
+        Serial.print(" dur=");
+        Serial.println(ev.duration_sec);
+      }
+      return;
+    }
+
+    // Set device zone id: !ZONE=<zoneid>#
+    if (cmd.startsWith("!ZONE=") && cmd.endsWith("#")) {
+      String z = cmd.substring(6, cmd.length() - 1);
+      z.trim();
+      if (z.length() > 0) {
+        this->deviceZoneId = z;
+        Serial.print("Device zone set to: ");
+        Serial.println(this->deviceZoneId);
+      }
+      return;
     }
   }
 
@@ -265,10 +406,25 @@ public:
   }
 
   void run() {
-    dht->update();
-    soil->update();
+    nowMs = millis();
+    bool soilUpdated = false;
+    bool dhtUpdated = false;
 
-    if (!dht->isValid()) {
+    // update soil sensor at its own interval
+    if (lastSoilMs == 0 || (nowMs - lastSoilMs) >= SOIL_READ_MS) {
+      soil->update();
+      lastSoilMs = nowMs;
+      soilUpdated = true;
+    }
+
+    // update DHT at its (slower) interval to avoid sensor errors
+    if (lastDhtMs == 0 || (nowMs - lastDhtMs) >= DHT_READ_MS) {
+      dht->update();
+      lastDhtMs = nowMs;
+      dhtUpdated = true;
+    }
+
+    if (dhtUpdated && !dht->isValid()) {
       display->show("DHT read error", "Check sensor");
       alertBlinkEnabled = true;
       return;
@@ -279,37 +435,117 @@ public:
     int soilPercent = soil->getPercent();
     int soilRaw = soil->getRaw();
 
-    if (remotePumpState) {
+    // Scheduling: check absolute schedule events pushed from gateway
+    unsigned long nowEpoch = currentEpochSec();
+    bool scheduledOn = false;
+    String matchedEventId = "";
+    unsigned long matchedEventStart = 0;
+    unsigned long matchedEventDur = 0;
+    if (haveTime && nowEpoch > 0) {
+      // check for active events
+      for (size_t i = 0; i < scheduleEvents.size(); i++) {
+        // if deviceZoneId set, only consider events for this zone
+        if (deviceZoneId.length() > 0 && scheduleEvents[i].zoneId.length() > 0 && scheduleEvents[i].zoneId != deviceZoneId) {
+          continue;
+        }
+        unsigned long s = scheduleEvents[i].start_ts;
+        unsigned long e = s + scheduleEvents[i].duration_sec;
+        if (nowEpoch >= s && nowEpoch < e) {
+          scheduledOn = true;
+          matchedEventId = scheduleEvents[i].id;
+          matchedEventStart = s;
+          matchedEventDur = scheduleEvents[i].duration_sec;
+          break;
+        }
+      }
+
+      // purge expired events that ended in the past
+      for (int i = (int)scheduleEvents.size() - 1; i >= 0; i--) {
+        unsigned long e = scheduleEvents[i].start_ts + scheduleEvents[i].duration_sec;
+        if (nowEpoch >= e + 60) { // remove 1 minute after end
+          scheduleEvents.erase(scheduleEvents.begin() + i);
+        }
+      }
+    }
+
+    // decide desired pump state (schedule has priority)
+    bool desiredOn = scheduledOn || remotePumpState;
+    bool wasOn = pump->isOn();
+
+    if (desiredOn && !wasOn) {
+      // turning on
       pump->on();
-    } else {
+      unsigned long ts = nowEpoch > 0 ? nowEpoch : 0;
+      String zid = deviceZoneId;
+      String id = matchedEventId;
+      // record active event
+      currentActiveEventId = id;
+      currentActiveStartEpoch = ts;
+      // send EVENT START
+      String ev = "!EVENT;TYPE=START";
+      if (zid.length() > 0) ev += ";ZONE=" + zid;
+      if (id.length() > 0) ev += ";ID=" + id;
+      ev += ";TS=" + String(ts) + "#";
+      Serial.println(ev);
+      Serial.print("");
+    } else if (!desiredOn && wasOn) {
+      // turning off
       pump->off();
+      unsigned long ts = nowEpoch > 0 ? nowEpoch : 0;
+      String zid = deviceZoneId;
+      String id = currentActiveEventId.length() > 0 ? currentActiveEventId : matchedEventId;
+      unsigned long start_ts = currentActiveStartEpoch ? currentActiveStartEpoch : matchedEventStart;
+      // send EVENT STOP (include START_TS when known)
+      String ev = "!EVENT;TYPE=STOP";
+      if (zid.length() > 0) ev += ";ZONE=" + zid;
+      if (id.length() > 0) ev += ";ID=" + id;
+      if (ts > 0) ev += ";TS=" + String(ts);
+      if (start_ts > 0) ev += ";START_TS=" + String(start_ts);
+      ev += "#";
+      Serial.println(ev);
+      // clear active
+      currentActiveEventId = "";
+      currentActiveStartEpoch = 0;
     }
 
   
     alertBlinkEnabled = false;
 
-    if (!lcdPage) {
-      display->show(
-        "T:" + String(temp, 1) + "C H:" + String((int)hum) + "%",
-        "Soil:" + String(soilPercent) + "%"
-      );
-    } else {
-      display->show(
-        "Pump:" + String(pump->isOn() ? "ON" : "OFF"),
-        "Raw:" + String(soilRaw)
-      );
+    // update LCD at human-friendly interval only (keep user display same)
+    if (lastLCDMs == 0 || (nowMs - lastLCDMs) >= LCD_UPDATE_MS) {
+      if (!lcdPage) {
+        display->show(
+          "T:" + String(temp, 1) + "C H:" + String((int)hum) + "%",
+          "Soil:" + String(soilPercent) + "%"
+        );
+      } else {
+        display->show(
+          "Pump:" + String(pump->isOn() ? "ON" : "OFF"),
+          "Raw:" + String(soilRaw)
+        );
+      }
+      lcdPage = !lcdPage;
+      lastLCDMs = nowMs;
     }
-
-    lcdPage = !lcdPage;
 
     String out = "!TEMP=" + String(temp, 1);
     out += ";HUMI=" + String(hum, 1);
     out += ";SOIL=" + String(soilPercent);
     out += ";RAW=" + String(soilRaw);
     out += ";PUMP=" + String(pump->isOn() ? 1 : 0);
+    // also include the raw relay pin level for debugging (HIGH/LOW)
+    out += ";RELAY=" + String(digitalRead(RELAY_PIN));
     out += "#";
 
-    Serial.println(out);
+    // Emit telemetry at fixed interval to keep serial monitor stable, but allow
+    // immediate emit when pump state changed.
+    if (desiredOn != wasOn) {
+      Serial.println(out);
+      lastTelemetryMs = nowMs;
+    } else if (lastTelemetryMs == 0 || (nowMs - lastTelemetryMs) >= TELEMETRY_PRINT_MS) {
+      Serial.println(out);
+      lastTelemetryMs = nowMs;
+    }
   }
 };
 
@@ -339,7 +575,8 @@ void loop() {
   controller.readSerialCommand();
   controller.updateBlinky();
 
-  if (millis() - lastRead > 3000) {
+  // run controller more frequently so soil updates reach gateway faster
+  if (millis() - lastRead > MAIN_LOOP_READ_MS) {
     lastRead = millis();
     controller.run();
   }
