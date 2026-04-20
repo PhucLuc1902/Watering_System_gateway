@@ -1302,12 +1302,24 @@ def send_to_adafruit_if_due():
     if state.latest_data is None:
         return
     now_ts = time.time()
+    mode = state.zone_cfg.profile.mode
+
+    # In MANUAL mode, the Adafruit pump feed is the COMMAND SOURCE (user controls pump
+    # via the dashboard).  Writing device telemetry PUMP state back to that same feed
+    # creates a feedback loop:  device reports PUMP=0 → gateway publishes 0 → poll reads
+    # 0 → gateway turns pump OFF.  Only publish PUMP when the gateway owns the pump
+    # (AUTO / SCHEDULE / AI); in those modes the Adafruit feed is purely an output/display.
+    gateway_owns_pump = mode in ("AUTO", "AI") or state.active_trigger in ("SCHEDULE", "PROFILE", "AI")
+
+    # Keys used for change-detection.  Exclude PUMP in MANUAL so a stale PUMP=0
+    # from the device does not trigger an immediate send cycle.
     keys_to_check = ["TEMP", "HUMI", "SOIL", "PUMP"]
+    keys_for_change = ["TEMP", "HUMI", "SOIL"] + (["PUMP"] if gateway_owns_pump else [])
 
     # detect change vs last sent data
     changed = False
     if SEND_IMMEDIATE_ON_CHANGE:
-        for k in keys_to_check:
+        for k in keys_for_change:
             if k in state.latest_data:
                 prev = state.last_sent_data.get(k)
                 curr = state.latest_data.get(k)
@@ -1327,17 +1339,12 @@ def send_to_adafruit_if_due():
             aio.send(FEED_HUM, state.latest_data["HUMI"])
         if "SOIL" in state.latest_data:
             aio.send(FEED_SOIL, state.latest_data["SOIL"])
-        if "PUMP" in state.latest_data:
-            pump_value_to_send = state.latest_data["PUMP"]
-            same_pump_feed = FEED_PUMP_STATE == FEED_PUMP_CMD
-            recent_manual = (time.time() - state.last_manual_command_at) < MANUAL_FEED_ECHO_SUPPRESS_SEC
-            if same_pump_feed and recent_manual and state.pending_manual_state is not None:
-                pump_value_to_send = state.pending_manual_state
-            aio.send(FEED_PUMP_STATE, pump_value_to_send)
-            if state.pending_manual_state is not None and int(pump_value_to_send) == int(state.latest_data["PUMP"]):
-                state.pending_manual_state = None
+        if "PUMP" in state.latest_data and gateway_owns_pump:
+            # Gateway-controlled modes: reflect actual pump state to Adafruit so the
+            # dashboard / history stay accurate.
+            aio.send(FEED_PUMP_STATE, state.latest_data["PUMP"])
         state.last_send_time = now_ts
-        # snapshot last sent
+        # snapshot last sent (always include PUMP for dedup even if not published)
         state.last_sent_data = {k: state.latest_data.get(k) for k in keys_to_check if k in state.latest_data}
         # After sending telemetry, update devices' last-active timestamps in backend
         try:
@@ -1357,6 +1364,7 @@ def send_to_adafruit_if_due():
     except Exception as exc:
         print("Send error:", exc)
         time.sleep(0.5)
+
 
 
 def handle_device_event(parsed: Dict[str, Any]) -> None:
