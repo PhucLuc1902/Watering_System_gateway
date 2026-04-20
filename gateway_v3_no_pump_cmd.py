@@ -981,6 +981,10 @@ def run_manual_logic():
         state.profile_min_end_at = None
         state.stop_above_count = 0
         send_pump_command(1)
+        # Set grace window so stale PUMP=0 telemetry from the ESP32 (arriving
+        # before it has processed the ON command) does not immediately trigger
+        # stop_irrigation("pump telemetry off"). Same guard used by start_irrigation().
+        state.ignore_pump_off_until = time.time() + PUMP_OFF_GRACE_SEC
         state.last_manual_command_at = time.time()
         state.pending_manual_state = 1
         state.last_manual_feed_value = 1
