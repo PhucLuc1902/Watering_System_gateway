@@ -650,11 +650,13 @@ def send_schedule_to_esp():
 # ==========================================================
 # IRRIGATION ACTIONS
 # ==========================================================
-def start_irrigation(trigger: str, duration_sec: Optional[int] = None, started_ts: Optional[float] = None):
+def start_irrigation(trigger: str, duration_sec: Optional[int] = None, started_ts: Optional[float] = None, effective_priority: Optional[int] = None):
     # Priority check: higher-priority trigger can preempt a running lower-priority one.
+    # effective_priority allows callers (e.g. schedule under low-soil condition) to
+    # temporarily boost their priority above the static TRIGGER_PRIORITY value.
     if state.pump_is_on:
         current_priority = TRIGGER_PRIORITY.get(state.active_trigger or "", 0)
-        new_priority = TRIGGER_PRIORITY.get(trigger, 0)
+        new_priority = effective_priority if effective_priority is not None else TRIGGER_PRIORITY.get(trigger, 0)
         if new_priority > current_priority:
             print(
                 f"[PRIORITY] {trigger} (p={new_priority}) preempting "
@@ -1182,26 +1184,75 @@ def run_ai_logic():
 
 
 def run_schedule_logic():
-    """Trigger schedule with exact timing and exact planned stop time."""
+    """Trigger schedule with exact timing and exact planned stop time.
+
+    Priority boost: when soil is below the lower threshold the schedule is
+    treated as higher priority than any active trigger (including MANUAL) so
+    the plant is watered even if a manual session is running.  In all other
+    cases the normal TRIGGER_PRIORITY table applies.
+    """
     try:
         hit = check_schedule_trigger()
         if hit is None:
             return
         slot, scheduled_ts = hit
+
+        # Determine effective priority for this schedule trigger.
+        # When soil is below the lower threshold the schedule is critical, so
+        # it gets a priority boost that beats even MANUAL (100) — set to 101.
+        soil_val: Optional[int] = None
+        below_threshold = False
+        if state.latest_data is not None:
+            soil_val = safe_int(state.latest_data.get("SOIL"), -1)
+            min_soil = state.zone_cfg.profile.min_soil
+            if soil_val >= 0 and soil_val < min_soil:
+                below_threshold = True
+
+        if below_threshold:
+            effective_priority = TRIGGER_PRIORITY["MANUAL"] + 1  # 101 — beats everything
+            print(
+                f"[SCHEDULE] Soil={soil_val}% is below min_soil={state.zone_cfg.profile.min_soil}% "
+                f"— schedule priority boosted to {effective_priority} (beats MANUAL)"
+            )
+        else:
+            effective_priority = TRIGGER_PRIORITY["SCHEDULE"]  # 75 — normal
+
         if state.pump_is_on:
             current_priority = TRIGGER_PRIORITY.get(state.active_trigger or "", 0)
-            if current_priority >= TRIGGER_PRIORITY.get("SCHEDULE", 0):
-                print(f"[SCHEDULE] Ignoring scheduled slot {slot.slot_id}: higher/equal priority active ({state.active_trigger})")
+            if effective_priority <= current_priority:
+                print(
+                    f"[SCHEDULE] Ignoring scheduled slot {slot.slot_id} "
+                    f"(schedule p={effective_priority} <= active {state.active_trigger} p={current_priority})"
+                )
                 return
-            # SCHEDULE can preempt lower-priority triggers via start_irrigation priority logic
+            # SCHEDULE will preempt lower-priority trigger via start_irrigation priority logic
+
         state.current_schedule_slot_id = slot.slot_id
         try:
             dur_sec = int(slot.duration)
         except Exception:
             dur_sec = slot.duration
         drift_ms = int((time.time() - scheduled_ts) * 1000)
-        print(f"[SCHEDULE] Triggering slot {slot.slot_id} planned={datetime.fromtimestamp(scheduled_ts).strftime('%H:%M:%S')} drift_ms={drift_ms} duration={dur_sec}s")
-        start_irrigation("SCHEDULE", dur_sec, started_ts=scheduled_ts)
+        sched_id_label = f" schedule_id={slot.schedule_id}" if slot.schedule_id else ""
+        boost_label = " [THRESHOLD BOOST]" if below_threshold else ""
+        print(
+            f"[SCHEDULE] Triggering slot={slot.slot_id}{sched_id_label}"
+            f" planned={datetime.fromtimestamp(scheduled_ts).strftime('%H:%M:%S')}"
+            f" drift_ms={drift_ms} duration={dur_sec}s{boost_label}"
+        )
+        publish_audit_log(
+            zone_id=state.zone_cfg.zone_id,
+            zone_name=state.zone_cfg.zone_name,
+            severity="INFO",
+            alert_type="IRRIGATION_EVENT",
+            actor="SCHEDULE",
+            message=(
+                f"Schedule triggered for zone {state.zone_cfg.zone_name or state.zone_cfg.zone_id}: "
+                f"slot_id={slot.slot_id}, schedule_id={slot.schedule_id or 'n/a'}, "
+                f"duration={dur_sec}s{', soil below threshold — priority boosted' if below_threshold else ''}"
+            ),
+        )
+        start_irrigation("SCHEDULE", dur_sec, started_ts=scheduled_ts, effective_priority=effective_priority)
     except Exception as exc:
         print("run_schedule_logic error:", exc)
 
