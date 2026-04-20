@@ -1375,19 +1375,22 @@ def handle_device_event(parsed: Dict[str, Any]) -> None:
             state.pump_is_on = True
             state.current_watering_started_at = state.current_watering_started_at or ets
             state.current_schedule_slot_id = state.current_schedule_slot_id or eid
-            if state.suppress_device_audit:
-                if not state.active_trigger:
-                    state.active_trigger = "DEVICE"
-            else:
+            # Only attribute to DEVICE and publish an audit when no gateway trigger is
+            # already owning this irrigation session.  If MANUAL/SCHEDULE/PROFILE/AI is
+            # active, the START echo from the device is pure confirmation — overwriting
+            # active_trigger here would cause the preemption logic (run_manual_logic etc.)
+            # to misfire on the very next loop iteration (stop → restart oscillation).
+            if not state.active_trigger:
                 state.active_trigger = "DEVICE"
-                publish_audit_log(
-                    zone_id=state.zone_cfg.zone_id,
-                    zone_name=state.zone_cfg.zone_name,
-                    severity="INFO",
-                    alert_type="IRRIGATION_EVENT",
-                    actor="DEVICE",
-                    message=json.dumps({"event": "start", "zone": ezone, "id": eid, "ts": ets}, ensure_ascii=False),
-                )
+                if not state.suppress_device_audit:
+                    publish_audit_log(
+                        zone_id=state.zone_cfg.zone_id,
+                        zone_name=state.zone_cfg.zone_name,
+                        severity="INFO",
+                        alert_type="IRRIGATION_EVENT",
+                        actor="DEVICE",
+                        message=json.dumps({"event": "start", "zone": ezone, "id": eid, "ts": ets}, ensure_ascii=False),
+                    )
 
         elif etype == "STOP":
             start_ts = parsed.get("EVENT_START_TS") or state.current_watering_started_at or (ets - (parsed.get("EVENT_DUR") or 0))
