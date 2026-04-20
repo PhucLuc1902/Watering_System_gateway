@@ -494,6 +494,9 @@ class GatewayState:
         self.last_ai_call_time: float = 0.0          # epoch of last successful AI API call
         self.ai_scheduled_start: Optional[float] = None   # epoch when AI wants pump to start
         self.ai_duration_sec: Optional[int] = None   # AI-prescribed run duration
+        # Set True only when AUTO/SCHEDULE/AI changes pump state; consumed once by
+        # send_to_adafruit_if_due then cleared. MANUAL never sets this flag.
+        self.pump_feed_dirty: bool = False
 
     def mark_device_seen(self, device: str):
         """Record that a given device (e.g. 'TEMP') was seen now.
@@ -681,6 +684,11 @@ def start_irrigation(trigger: str, duration_sec: Optional[int] = None, started_t
     # ignore pump OFF telemetry for a short grace window after we command ON
     state.ignore_pump_off_until = now_ts + PUMP_OFF_GRACE_SEC
 
+    # If this irrigation is gateway-initiated (AUTO/SCHEDULE/AI), mark pump feed
+    # as needing a publish so Adafruit dashboard reflects the new state exactly once.
+    if trigger in ("PROFILE", "SCHEDULE", "AI"):
+        state.pump_feed_dirty = True
+
     # finally, command the pump ON
     send_pump_command(1)
     # We intentionally do NOT publish a "start" irrigation event here.
@@ -757,6 +765,9 @@ def stop_irrigation(reason: str, started_ts: Optional[float] = None, force: bool
 
     # mark signature and clear suppression/state
     state.last_irrigation_event_signature = signature
+    # Flag pump feed for publish if this was a gateway-owned irrigation session.
+    if state.active_trigger in ("PROFILE", "SCHEDULE", "AI"):
+        state.pump_feed_dirty = True
     state.suppress_device_audit = False
     state.active_trigger = None
     state.current_watering_started_at = None
@@ -1302,19 +1313,16 @@ def send_to_adafruit_if_due():
     if state.latest_data is None:
         return
     now_ts = time.time()
-    mode = state.zone_cfg.profile.mode
 
-    # In MANUAL mode, the Adafruit pump feed is the COMMAND SOURCE (user controls pump
-    # via the dashboard).  Writing device telemetry PUMP state back to that same feed
-    # creates a feedback loop:  device reports PUMP=0 → gateway publishes 0 → poll reads
-    # 0 → gateway turns pump OFF.  Only publish PUMP when the gateway owns the pump
-    # (AUTO / SCHEDULE / AI); in those modes the Adafruit feed is purely an output/display.
-    gateway_owns_pump = mode in ("AUTO", "AI") or state.active_trigger in ("SCHEDULE", "PROFILE", "AI")
+    # PUMP is only published to Adafruit when an AUTO/SCHEDULE/AI pump event fires
+    # (start or stop).  The flag is set exactly then and consumed once here.
+    # Regular interval/change sends (TEMP/HUMI/SOIL) never carry PUMP.
+    publish_pump_now = state.pump_feed_dirty
 
-    # Keys used for change-detection.  Exclude PUMP in MANUAL so a stale PUMP=0
-    # from the device does not trigger an immediate send cycle.
+    # Change-detection: never trigger on PUMP so device telemetry PUMP changes
+    # don't cause premature sends or Adafruit feedback loops.
     keys_to_check = ["TEMP", "HUMI", "SOIL", "PUMP"]
-    keys_for_change = ["TEMP", "HUMI", "SOIL"] + (["PUMP"] if gateway_owns_pump else [])
+    keys_for_change = ["TEMP", "HUMI", "SOIL"]
 
     # detect change vs last sent data
     changed = False
@@ -1327,24 +1335,23 @@ def send_to_adafruit_if_due():
                     changed = True
                     break
 
-    # if nothing changed and interval hasn't elapsed, skip sending
-    if (not changed) and (now_ts - state.last_send_time < SEND_INTERVAL_SEC):
+    # if nothing changed, no pump event, and interval hasn't elapsed, skip
+    if (not changed) and (not publish_pump_now) and (now_ts - state.last_send_time < SEND_INTERVAL_SEC):
         return
 
     try:
-        print("Sending to Adafruit...", "(changed)" if changed else "(interval)")
+        print("Sending to Adafruit...", "(changed)" if changed else "(pump event)" if publish_pump_now else "(interval)")
         if "TEMP" in state.latest_data:
             aio.send(FEED_TEMP, state.latest_data["TEMP"])
         if "HUMI" in state.latest_data:
             aio.send(FEED_HUM, state.latest_data["HUMI"])
         if "SOIL" in state.latest_data:
             aio.send(FEED_SOIL, state.latest_data["SOIL"])
-        if "PUMP" in state.latest_data and gateway_owns_pump:
-            # Gateway-controlled modes: reflect actual pump state to Adafruit so the
-            # dashboard / history stay accurate.
+        if publish_pump_now and "PUMP" in state.latest_data:
             aio.send(FEED_PUMP_STATE, state.latest_data["PUMP"])
+            state.pump_feed_dirty = False  # consumed
         state.last_send_time = now_ts
-        # snapshot last sent (always include PUMP for dedup even if not published)
+        # snapshot last sent (always track PUMP for dedup even if not published)
         state.last_sent_data = {k: state.latest_data.get(k) for k in keys_to_check if k in state.latest_data}
         # After sending telemetry, update devices' last-active timestamps in backend
         try:
@@ -1364,7 +1371,6 @@ def send_to_adafruit_if_due():
     except Exception as exc:
         print("Send error:", exc)
         time.sleep(0.5)
-
 
 
 def handle_device_event(parsed: Dict[str, Any]) -> None:
