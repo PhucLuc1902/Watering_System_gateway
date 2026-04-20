@@ -59,6 +59,11 @@ SOIL_RAW_WET = int(os.getenv("SOIL_RAW_WET", "1200"))
 COMPUTE_SOIL_FROM_RAW = str(os.getenv("COMPUTE_SOIL_FROM_RAW", "1")).strip().lower() in ("1", "true", "yes", "on")
 STOP_HYSTERESIS_COUNT = int(os.getenv("STOP_HYSTERESIS_COUNT", "1"))
 
+# AI mode config
+AI_CALL_INTERVAL_SEC = int(os.getenv("AI_CALL_INTERVAL_SEC", "3600"))  # seconds between proactive AI calls
+AI_LAT = float(os.getenv("AI_LAT", "10.7291"))
+AI_LON = float(os.getenv("AI_LON", "106.6984"))
+
 GMAIL_SENDER = os.getenv("GMAIL_SENDER", "")
 GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD", "")
 GMAIL_RECEIVER = os.getenv("GMAIL_RECEIVER", "")
@@ -206,6 +211,15 @@ DEVICE_FRIENDLY: Dict[str, str] = {
     "PUMP": "Relay",
 }
 
+# Trigger priority: higher number wins. Manual always beats everything.
+TRIGGER_PRIORITY: Dict[str, int] = {
+    "MANUAL": 100,
+    "SCHEDULE": 75,
+    "PROFILE": 50,
+    "AI": 25,
+    "DEVICE": 10,
+}
+
 # ==========================================================
 # DATA MODELS
 # ==========================================================
@@ -345,6 +359,30 @@ class BackendClient:
             payload["duration"] = duration
         self._post("/api/irrigation-events", payload)
 
+    def call_ai_irrigation(self, zone_id: str, lat: float = 10.7291, lon: float = 106.6984) -> Optional[tuple]:
+        """POST /api/ai/irrigation and return (scheduled_at_epoch, duration_seconds) or None."""
+        payload: Dict[str, Any] = {"zoneId": zone_id, "lat": lat, "lon": lon}
+        result = self._post("/api/ai/irrigation", payload)
+        if not isinstance(result, dict):
+            return None
+        scheduled_at_str = result.get("scheduled_at")
+        duration_seconds = result.get("duration_seconds")
+        if scheduled_at_str is None or duration_seconds is None:
+            return None
+        try:
+            s = str(scheduled_at_str).strip()
+            # Try with timezone first (Z or +HH:MM)
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except ValueError:
+                # No timezone — treat as local naive datetime
+                dt = datetime.fromisoformat(s)
+            epoch = dt.timestamp()
+            return epoch, int(duration_seconds)
+        except Exception as exc:
+            print("AI irrigation response parse error:", exc)
+            return None
+
     def update_devices_last_active(self, zone_id: str, devices: Dict[str, str]) -> None:
         """Update last active timestamps for devices in the backend.
 
@@ -452,6 +490,10 @@ class GatewayState:
         self.last_manual_feed_value: Optional[int] = None
         self.last_manual_command_at: float = 0.0
         self.pending_manual_state: Optional[int] = None
+        # AI mode state
+        self.last_ai_call_time: float = 0.0          # epoch of last successful AI API call
+        self.ai_scheduled_start: Optional[float] = None   # epoch when AI wants pump to start
+        self.ai_duration_sec: Optional[int] = None   # AI-prescribed run duration
 
     def mark_device_seen(self, device: str):
         """Record that a given device (e.g. 'TEMP') was seen now.
@@ -597,13 +639,31 @@ def send_schedule_to_esp():
 # IRRIGATION ACTIONS
 # ==========================================================
 def start_irrigation(trigger: str, duration_sec: Optional[int] = None, started_ts: Optional[float] = None):
+    # Priority check: higher-priority trigger can preempt a running lower-priority one.
     if state.pump_is_on:
-        return
+        current_priority = TRIGGER_PRIORITY.get(state.active_trigger or "", 0)
+        new_priority = TRIGGER_PRIORITY.get(trigger, 0)
+        if new_priority > current_priority:
+            print(
+                f"[PRIORITY] {trigger} (p={new_priority}) preempting "
+                f"{state.active_trigger} (p={current_priority})"
+            )
+            stop_irrigation(
+                f"preempted by higher-priority trigger: {trigger}",
+                force=True,
+            )
+            # fall through to start the new irrigation below
+        else:
+            print(
+                f"[PRIORITY] {trigger} (p={new_priority}) blocked by "
+                f"{state.active_trigger} (p={current_priority})"
+            )
+            return
     state.active_trigger = trigger
     now_ts = time.time()
     effective_start_ts = float(started_ts) if started_ts is not None else now_ts
     state.current_watering_started_at = effective_start_ts
-    state.current_schedule_end_at = (effective_start_ts + duration_sec) if trigger in ("SCHEDULE", "PROFILE") and duration_sec is not None else None
+    state.current_schedule_end_at = (effective_start_ts + duration_sec) if trigger in ("SCHEDULE", "PROFILE", "AI") and duration_sec is not None else None
 
     # For PROFILE-triggered runs, enforce a minimum run duration to avoid rapid on/off toggling
     if trigger == "PROFILE":
@@ -617,7 +677,7 @@ def start_irrigation(trigger: str, duration_sec: Optional[int] = None, started_t
     # If this irrigation was started by schedule or profile, suppress device-originated
     # audit log entries for START/STOP to avoid duplicate events. Set suppression
     # before sending the ON command to avoid races with immediate telemetry.
-    state.suppress_device_audit = True if trigger in ("SCHEDULE", "PROFILE") else False
+    state.suppress_device_audit = True if trigger in ("SCHEDULE", "PROFILE", "AI") else False
     # ignore pump OFF telemetry for a short grace window after we command ON
     state.ignore_pump_off_until = now_ts + PUMP_OFF_GRACE_SEC
 
@@ -630,7 +690,7 @@ def start_irrigation(trigger: str, duration_sec: Optional[int] = None, started_t
     except Exception:
         pass
 
-def stop_irrigation(reason: str, started_ts: Optional[float] = None, force: bool = False):
+def stop_irrigation(reason: str, started_ts: Optional[float] = None, force: bool = False, actor: str = "SYSTEM"):
     """Stop irrigation and publish a single completed irrigation event.
 
     If `started_ts` is provided use it as the start time; otherwise use the
@@ -691,7 +751,7 @@ def stop_irrigation(reason: str, started_ts: Optional[float] = None, force: bool
         zone_name=state.zone_cfg.zone_name,
         severity="INFO",
         alert_type="IRRIGATION_EVENT",
-        actor="SYSTEM",
+        actor=actor,
         message=f"Irrigation completed for zone {state.zone_cfg.zone_name or state.zone_cfg.zone_id}: {json.dumps(event_payload, ensure_ascii=False)}",
     )
 
@@ -883,6 +943,11 @@ def poll_manual_command_from_feed() -> Optional[bool]:
 
 
 def run_manual_logic():
+    """Run manual pump control. Always called regardless of profile mode.
+
+    Manual has the highest priority: it can preempt any active trigger
+    (SCHEDULE, PROFILE/AUTO, AI) when the user explicitly commands the pump.
+    """
     desired: Optional[bool] = None
 
     if state.zone_cfg.manual_pump_on is not None:
@@ -896,6 +961,14 @@ def run_manual_logic():
         return
 
     desired_value = 1 if desired else 0
+
+    # Preempt any active non-manual trigger when the user explicitly wants ON
+    if desired and state.pump_is_on and state.active_trigger != "MANUAL":
+        print(f"[MANUAL] Overriding active trigger '{state.active_trigger}' — taking manual control")
+        # Stop the current irrigation cleanly (records event, clears state)
+        stop_irrigation("manual override", started_ts=state.current_watering_started_at, force=True)
+        # Now fall through to the start block below (pump_is_on will be False after stop)
+
     if state.last_manual_command == desired_value and state.pump_is_on == desired:
         return
 
@@ -940,7 +1013,7 @@ def run_auto_logic():
     soil = safe_int(state.latest_data.get("SOIL"), 0)
     min_soil = state.zone_cfg.profile.min_soil
     max_soil = state.zone_cfg.profile.max_soil
-    stop_target = max_soil
+    stop_target = midpoint(min_soil, max_soil)
 
     # schedule handling moved to `run_schedule_logic()` called from main loop
 
@@ -984,7 +1057,81 @@ def run_auto_logic():
         stop_irrigation("schedule duration completed")
 
 def run_ai_logic():
-    return
+    """AI mode: call irrigation AI API every hour or when soil < threshold.
+
+    The AI response returns a scheduled_at time and duration_seconds.
+    The pump starts at that time and the irrigation event is recorded with actor='AI'.
+    """
+    if state.zone_cfg.profile.mode != "AI":
+        return
+    if state.latest_data is None:
+        return
+
+    soil = safe_int(state.latest_data.get("SOIL"), 0)
+    min_soil = state.zone_cfg.profile.min_soil
+    now_ts = time.time()
+
+    time_since_last_call = now_ts - state.last_ai_call_time
+    should_call_hourly = time_since_last_call >= AI_CALL_INTERVAL_SEC
+    # Call on threshold breach only when no schedule is already pending
+    should_call_threshold = (
+        soil < min_soil
+        and state.ai_scheduled_start is None
+        and not state.pump_is_on
+    )
+
+    if (should_call_hourly or should_call_threshold) and not state.pump_is_on:
+        try:
+            print(
+                f"[AI] Calling AI irrigation API (soil={soil}%, min={min_soil}%, "
+                f"interval={int(time_since_last_call)}s, threshold_breach={should_call_threshold})"
+            )
+            result = backend.call_ai_irrigation(state.zone_cfg.zone_id, AI_LAT, AI_LON)
+            state.last_ai_call_time = now_ts  # update regardless to avoid hammering on failure
+            if result is not None:
+                scheduled_epoch, ai_dur_sec = result
+                state.ai_scheduled_start = scheduled_epoch
+                state.ai_duration_sec = ai_dur_sec
+                scheduled_str = datetime.fromtimestamp(scheduled_epoch).strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[AI] Irrigation scheduled at {scheduled_str} for {ai_dur_sec}s")
+                publish_audit_log(
+                    zone_id=state.zone_cfg.zone_id,
+                    zone_name=state.zone_cfg.zone_name,
+                    severity="INFO",
+                    alert_type="IRRIGATION_EVENT",
+                    actor="AI",
+                    message=(
+                        f"AI irrigation scheduled: starts at {scheduled_str}, "
+                        f"duration {ai_dur_sec}s"
+                    ),
+                )
+            else:
+                print("[AI] AI API returned no schedulable result")
+        except Exception as exc:
+            print("AI irrigation API error:", exc)
+            state.last_ai_call_time = now_ts
+
+    # Start the AI-scheduled pump when the scheduled time arrives
+    if (
+        state.ai_scheduled_start is not None
+        and not state.pump_is_on
+        and now_ts >= state.ai_scheduled_start
+    ):
+        dur = state.ai_duration_sec or 60
+        drift_ms = int((now_ts - state.ai_scheduled_start) * 1000)
+        print(f"[AI] Starting AI-scheduled irrigation, duration={dur}s, drift={drift_ms}ms")
+        state.ai_scheduled_start = None
+        state.ai_duration_sec = None
+        start_irrigation("AI", dur, started_ts=now_ts)
+
+    # Stop AI irrigation when its duration expires
+    if (
+        state.pump_is_on
+        and state.active_trigger == "AI"
+        and state.current_schedule_end_at is not None
+        and now_ts >= state.current_schedule_end_at
+    ):
+        stop_irrigation("AI schedule duration completed", actor="AI")
 
 
 def run_schedule_logic():
@@ -995,8 +1142,11 @@ def run_schedule_logic():
             return
         slot, scheduled_ts = hit
         if state.pump_is_on:
-            print(f"[SCHEDULE] Ignoring scheduled slot {slot.slot_id}: pump already on")
-            return
+            current_priority = TRIGGER_PRIORITY.get(state.active_trigger or "", 0)
+            if current_priority >= TRIGGER_PRIORITY.get("SCHEDULE", 0):
+                print(f"[SCHEDULE] Ignoring scheduled slot {slot.slot_id}: higher/equal priority active ({state.active_trigger})")
+                return
+            # SCHEDULE can preempt lower-priority triggers via start_irrigation priority logic
         state.current_schedule_slot_id = slot.slot_id
         try:
             dur_sec = int(slot.duration)
@@ -1377,22 +1527,31 @@ while True:
     except Exception:
         pass
 
+    # Manual control always runs first — highest priority, overrides all modes.
+    run_manual_logic()
+
     mode = state.zone_cfg.profile.mode
-    if mode == "MANUAL":
-        run_manual_logic()
-    elif mode == "AUTO":
-        run_auto_logic()
+    if mode == "AUTO":
+        # Only run auto logic if pump is not already under manual control
+        if state.active_trigger != "MANUAL":
+            run_auto_logic()
     elif mode == "AI":
-        run_ai_logic()
+        # Only run AI logic if pump is not already under manual control
+        if state.active_trigger != "MANUAL":
+            run_ai_logic()
 
     try:
         if (
             state.pump_is_on
-            and state.active_trigger == "SCHEDULE"
+            and state.active_trigger in ("SCHEDULE", "AI")
             and state.current_schedule_end_at is not None
             and time.time() >= state.current_schedule_end_at
         ):
-            stop_irrigation("schedule duration completed (gateway timer)")
+            trigger_actor = "AI" if state.active_trigger == "AI" else "SYSTEM"
+            stop_irrigation(
+                f"{state.active_trigger.lower()} duration completed (gateway timer)",
+                actor=trigger_actor,
+            )
     except Exception:
         pass
 
