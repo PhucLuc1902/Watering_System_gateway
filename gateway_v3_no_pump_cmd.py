@@ -32,8 +32,12 @@ FEED_SOIL = os.getenv("FEED_SOIL", "soil")
 FEED_PUMP = os.getenv("FEED_PUMP", "pump")
 FEED_PUMP_CMD = os.getenv("FEED_PUMP_CMD", FEED_PUMP)
 FEED_PUMP_STATE = os.getenv("FEED_PUMP_STATE", FEED_PUMP)
-MANUAL_FEED_ECHO_SUPPRESS_SEC = float(os.getenv("MANUAL_FEED_ECHO_SUPPRESS_SEC", "2.0"))
+MANUAL_FEED_ECHO_SUPPRESS_SEC = float(os.getenv("MANUAL_FEED_ECHO_SUPPRESS_SEC", "30.0"))
 FEED_AUDIT = os.getenv("FEED_AUDIT", "audit-log")
+# Set AIO_AUDIT_FEED_ENABLED=1 to also publish audit events to the Adafruit audit-log feed.
+# Disabled by default because each event consumes a data point and can cause throttling.
+# All audit events still go to the backend API regardless of this setting.
+AIO_AUDIT_FEED_ENABLED = str(os.getenv("AIO_AUDIT_FEED_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM4")
 SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
@@ -44,12 +48,35 @@ API_TOKEN = os.getenv("API_TOKEN", "")
 SCHEDULE_ID = os.getenv("SCHEDULE_ID", "")
 
 CONFIG_REFRESH_SEC = int(os.getenv("CONFIG_REFRESH_SEC", "15"))
-SEND_INTERVAL_SEC = int(os.getenv("SEND_INTERVAL_SEC", "10"))
+# Separate send intervals for sensor data vs pump state.
+# Sensor feeds (TEMP/HUMI/SOIL) are pushed every SENSOR_SEND_INTERVAL_SEC seconds.
+# Adafruit free tier = 30 data points/minute. With 3 sensor feeds:
+#   SENSOR_SEND_INTERVAL_SEC=30 → ~6 pts/min  (safe, leaves room for pump/audit events)
+#   SENSOR_SEND_INTERVAL_SEC=10 → ~18 pts/min  (acceptable)
+#   SENSOR_SEND_INTERVAL_SEC=2  → ~90 pts/min  (always throttled — AVOID)
+SENSOR_SEND_INTERVAL_SEC = int(os.getenv("SENSOR_SEND_INTERVAL_SEC", "15"))
+PUMP_SEND_INTERVAL_SEC = int(os.getenv("PUMP_SEND_INTERVAL_SEC", "5"))
+# Legacy alias: if old SEND_INTERVAL_SEC is set, it overrides sensor interval for back-compat.
+_legacy = os.getenv("SEND_INTERVAL_SEC")
+if _legacy is not None:
+    SENSOR_SEND_INTERVAL_SEC = int(_legacy)
 ALERT_INTERVAL_SEC = int(os.getenv("ALERT_INTERVAL_SEC", "300"))
 DEVICE_OFFLINE_SEC = int(os.getenv("DEVICE_OFFLINE_SEC", "30"))
 PROFILE_MIN_RUN_SEC = int(os.getenv("PROFILE_MIN_RUN_SEC", "0"))
 PUMP_OFF_GRACE_SEC = int(os.getenv("PUMP_OFF_GRACE_SEC", "3"))
-SEND_IMMEDIATE_ON_CHANGE = str(os.getenv("SEND_IMMEDIATE_ON_CHANGE", "1")).strip().lower() in ("1", "true", "yes", "on")
+# SEND_IMMEDIATE_ON_CHANGE: push sensor data immediately when a value changes.
+# Disable by default to avoid blowing the Adafruit rate limit — rely on the
+# periodic SENSOR_SEND_INTERVAL_SEC timer instead.
+SEND_IMMEDIATE_ON_CHANGE = str(os.getenv("SEND_IMMEDIATE_ON_CHANGE", "0")).strip().lower() in ("1", "true", "yes", "on")
+# ── Adafruit send optimisation ─────────────────────────────────────────────
+# AIO_MIN_SEND_INTERVAL_SEC : minimum seconds between consecutive Adafruit batches.
+# AIO_FEED_DELAY_SEC        : pause between individual aio.send() calls in one batch
+#                             (helps stay under Adafruit's per-second request cap).
+# SOIL_SEND_MIN_DELTA       : minimum soil-% change required to trigger a send
+#                             (dead-zone filter to suppress ADC noise).
+AIO_MIN_SEND_INTERVAL_SEC  = int(os.getenv("AIO_MIN_SEND_INTERVAL_SEC", "3"))
+AIO_FEED_DELAY_SEC         = float(os.getenv("AIO_FEED_DELAY_SEC", "0.2"))
+SOIL_SEND_MIN_DELTA        = int(os.getenv("SOIL_SEND_MIN_DELTA", "2"))
 # When disabled, schedules are enforced only by the gateway (recommended).
 PUSH_SCHEDULE_TO_ESP = str(os.getenv("PUSH_SCHEDULE_TO_ESP", "0")).strip().lower() in ("1", "true", "yes", "on")
 # Optional: compute SOIL percent on the gateway from raw ADC value reported by device.
@@ -506,6 +533,19 @@ class GatewayState:
         # Set True only when AUTO/SCHEDULE/AI changes pump state; consumed once by
         # send_to_adafruit_if_due then cleared. MANUAL never sets this flag.
         self.pump_feed_dirty: bool = False
+        # Initialise to now so the very first send_to_adafruit_if_due() call
+        # does NOT immediately publish a stale PUMP=0 before ESP32 confirms state.
+        self.last_pump_send_time: float = time.time()
+        # Echo-suppression: track the last pump-state value the gateway wrote to
+        # FEED_PUMP_STATE so poll_manual_command_from_feed() can discard reads
+        # that are merely our own echo (when FEED_PUMP_CMD == FEED_PUMP_STATE).
+        self.last_pump_state_write_time: float = 0.0
+        self.last_pump_state_write_value: Optional[int] = None
+        # Non-blocking Adafruit throttle management.
+        # When a ThrottlingError is received, set this to the future epoch when
+        # the rate-limit window resets.  All aio calls check this first and skip
+        # rather than blocking the control loop with time.sleep().
+        self.aio_throttle_until: float = 0.0
 
     def mark_device_seen(self, device: str):
         """Record that a given device (e.g. 'TEMP') was seen now.
@@ -536,6 +576,17 @@ ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=0.05)
 
 print("Gateway started...")
 
+# Debounce dict for high-frequency log lines — maps message key to last-printed epoch.
+# Use _warn(key, msg) to print at most once every WARN_INTERVAL_SEC seconds.
+WARN_INTERVAL_SEC = 30.0
+_warn_last: Dict[str, float] = {}
+
+def _warn(key: str, msg: str) -> None:
+    now = time.time()
+    if now - _warn_last.get(key, 0) >= WARN_INTERVAL_SEC:
+        print(msg)
+        _warn_last[key] = now
+
 # ==========================================================
 # AUDIT LOG PUBLISHER
 # ==========================================================
@@ -551,6 +602,13 @@ def publish_audit_log(*, zone_id: Optional[str], zone_name: str, severity: str, 
     except Exception as exc:
         print("Create alert error:", exc)
 
+    # Optionally publish to the Adafruit audit-log feed.
+    # Off by default (AIO_AUDIT_FEED_ENABLED=0) to conserve data points.
+    if not AIO_AUDIT_FEED_ENABLED:
+        return
+    # Skip Adafruit publish if we are in the throttle window
+    if time.time() < state.aio_throttle_until:
+        return
     try:
         payload = {
             "zoneId": zone_id,
@@ -562,6 +620,9 @@ def publish_audit_log(*, zone_id: Optional[str], zone_name: str, severity: str, 
             "ts": now_iso(),
         }
         aio.send(FEED_AUDIT, json.dumps(payload, ensure_ascii=False))
+    except ThrottlingError:
+        state.aio_throttle_until = time.time() + 65
+        print("[THROTTLE] Audit-log send throttled; Adafruit I/O paused for 65 s")
     except Exception as exc:
         print("Send audit feed error:", exc)
 
@@ -909,12 +970,17 @@ def refresh_zone_config(force: bool = False):
 # MODE LOGIC
 # ==========================================================
 def check_schedule_trigger() -> Optional[tuple[TimeSlot, float]]:
-    # Use exact local seconds and a tight trigger window so schedule timing is precise.
+    # Trigger window: how many seconds AFTER the scheduled start time we will
+    # still fire the slot.  Blocking HTTP calls (refresh_zone_config, Adafruit
+    # sends) can stall the main loop for several seconds, so 2 s was too tight
+    # and slots were silently missed.  60 s is safe because
+    # `processed_schedule_marks` (keyed {today}:{slot_id}) prevents the slot
+    # from firing more than once per day regardless of how wide this window is.
     now_dt = datetime.now().astimezone()
     current_day = now_dt.strftime("%A")
     today = now_dt.strftime("%Y-%m-%d")
     now_ts = time.time()
-    TRIGGER_WINDOW_SEC = 2.0
+    TRIGGER_WINDOW_SEC = 60.0
 
     for slot in state.zone_cfg.time_slots:
         if slot.days and current_day not in slot.days:
@@ -944,7 +1010,13 @@ def check_schedule_trigger() -> Optional[tuple[TimeSlot, float]]:
 
 def poll_manual_command_from_feed() -> Optional[bool]:
     now_ts = time.time()
-    if now_ts - state.last_manual_poll_time < 0.5:
+    # Respect throttle window — return cached value without hitting Adafruit
+    if now_ts < state.aio_throttle_until:
+        if state.last_manual_feed_value is None:
+            return None
+        return bool(state.last_manual_feed_value)
+    # Cache poll result for 3 seconds to reduce Adafruit API calls
+    if now_ts - state.last_manual_poll_time < 3.0:
         if state.last_manual_feed_value is None:
             return None
         return bool(state.last_manual_feed_value)
@@ -956,6 +1028,25 @@ def poll_manual_command_from_feed() -> Optional[bool]:
         parsed = coerce_bool(raw)
         if parsed is None:
             return None
+
+        # ── Echo suppression ───────────────────────────────────────────────────
+        # When FEED_PUMP_CMD and FEED_PUMP_STATE share the same Adafruit feed
+        # the gateway's own pump-state writes appear as incoming commands.
+        # If we wrote a pump state recently and the returned value matches what
+        # we wrote, discard it and return the previously cached command value.
+        if FEED_PUMP_CMD == FEED_PUMP_STATE:
+            echo_age = now_ts - state.last_pump_state_write_time
+            if (
+                echo_age < MANUAL_FEED_ECHO_SUPPRESS_SEC
+                and state.last_pump_state_write_value is not None
+                and coerce_bool(raw) == bool(state.last_pump_state_write_value)
+            ):
+                print(
+                    f"[ECHO] Suppressing Adafruit read (value={raw}, echo_age={echo_age:.1f}s < "
+                    f"{MANUAL_FEED_ECHO_SUPPRESS_SEC}s) — returning cached command"
+                )
+                return bool(state.last_manual_feed_value) if state.last_manual_feed_value is not None else None
+        # ── End echo suppression ───────────────────────────────────────────────
         # Compute age of this feed value from its created_at timestamp so we can
         # distinguish a live command from a stale historical value.
         try:
@@ -969,6 +1060,12 @@ def poll_manual_command_from_feed() -> Optional[bool]:
             state.last_manual_feed_age_sec = 0.0
         state.last_manual_feed_value = 1 if parsed else 0
         return parsed
+    except ThrottlingError:
+        state.aio_throttle_until = time.time() + 65
+        print("[THROTTLE] Poll throttled; Adafruit I/O paused for 65 s")
+        if state.last_manual_feed_value is None:
+            return None
+        return bool(state.last_manual_feed_value)
     except Exception:
         if state.last_manual_feed_value is None:
             return None
@@ -995,12 +1092,40 @@ def run_manual_logic():
 
     desired_value = 1 if desired else 0
 
-    # Preempt any active non-manual trigger when the user explicitly wants ON
+    # Preempt an active non-manual trigger ONLY if the Adafruit feed value is
+    # NEWER than the gateway's last pump-state write to that same feed.
+    #
+    # When FEED_PUMP_CMD == FEED_PUMP_STATE (shared "pump" feed) the gateway
+    # writes PUMP=1 when a PROFILE/SCHEDULE session starts.  Until the user
+    # explicitly sends a NEW command after that write, every read returns our
+    # own echo.  We detect this by comparing:
+    #   last_manual_feed_age_sec  — how old is the value Adafruit returned?
+    #   write_age_sec             — how long ago did we last write pump state?
+    # If feed_age >= write_age the value was already in the feed before or at
+    # our write → it is our echo, not a new user action.
     if desired and state.pump_is_on and state.active_trigger != "MANUAL":
+        now_ts = time.time()
+        write_age_sec = now_ts - state.last_pump_state_write_time
+        # Phase 1: hard echo window — never preempt immediately after a write
+        if write_age_sec < MANUAL_FEED_ECHO_SUPPRESS_SEC:
+            _warn(
+                "echo_window",
+                f"[MANUAL] Echo window active ({write_age_sec:.1f}s < "
+                f"{MANUAL_FEED_ECHO_SUPPRESS_SEC}s), ignoring feed",
+            )
+            return
+        # Phase 2: feed timestamp check — value must post-date our last write
+        feed_newer_than_write = state.last_manual_feed_age_sec < write_age_sec
+        if not feed_newer_than_write:
+            _warn(
+                "feed_not_newer",
+                f"[MANUAL] Feed (age={state.last_manual_feed_age_sec:.0f}s) not newer than "
+                f"last write ({write_age_sec:.0f}s ago) — echo, no preempt",
+            )
+            return
         print(f"[MANUAL] Overriding active trigger '{state.active_trigger}' — taking manual control")
-        # Stop the current irrigation cleanly (records event, clears state)
         stop_irrigation("manual override", started_ts=state.current_watering_started_at, force=True)
-        # Now fall through to the start block below (pump_is_on will be False after stop)
+        # fall through to start block (pump_is_on will be False after stop)
 
     if state.last_manual_command == desired_value and state.pump_is_on == desired:
         return
@@ -1029,10 +1154,11 @@ def run_manual_logic():
         # MANUAL sessions are always stoppable regardless of feed age.
         feed_is_fresh = state.last_manual_feed_age_sec <= MANUAL_FEED_STALE_SEC
         if state.active_trigger != "MANUAL" and not feed_is_fresh:
-            print(
+            _warn(
+                "stale_off",
                 f"[MANUAL] Ignoring stale OFF command "
                 f"(feed age={int(state.last_manual_feed_age_sec)}s > {MANUAL_FEED_STALE_SEC}s) "
-                f"while {state.active_trigger} is active"
+                f"while {state.active_trigger} is active",
             )
             return
         started_ts = state.current_watering_started_at
@@ -1053,9 +1179,12 @@ def run_auto_logic():
     if state.latest_data is None:
         return
 
-    # Debug: show current time and number of configured slots (helps diagnose missed triggers)
+    # Debug: show current time and slot count (rate-limited to avoid log spam)
     try:
-        print(f"[DEBUG] run_auto_logic: hhmm={hhmm_now()} slots={len(state.zone_cfg.time_slots)} mode={state.zone_cfg.profile.mode}")
+        _warn(
+            "auto_logic_debug",
+            f"[DEBUG] run_auto_logic: hhmm={hhmm_now()} slots={len(state.zone_cfg.time_slots)} mode={state.zone_cfg.profile.mode}",
+        )
     except Exception:
         pass
 
@@ -1086,9 +1215,10 @@ def run_auto_logic():
             else:
                 state.stop_above_count = 0
 
-    # if pump is on but trigger is not PROFILE (e.g., DEVICE/manual), keep previous behavior
-    if state.pump_is_on and state.active_trigger not in ("PROFILE", "SCHEDULE") and soil >= min_soil:
-        stop_irrigation(f"soil reached midpoint target {min_soil}%")
+    # Only stop DEVICE-initiated irrigation based on soil threshold.
+    # MANUAL, AI, and gateway-owned triggers have their own stop conditions.
+    if state.pump_is_on and state.active_trigger == "DEVICE" and soil >= stop_target:
+        stop_irrigation(f"DEVICE irrigation: soil reached stop target {stop_target}%")
 
     # In AUTO mode, let soil safety override a scheduled irrigation if the soil is already wet enough.
     if state.pump_is_on and state.active_trigger == "SCHEDULE":
@@ -1240,19 +1370,24 @@ def run_schedule_logic():
             f" planned={datetime.fromtimestamp(scheduled_ts).strftime('%H:%M:%S')}"
             f" drift_ms={drift_ms} duration={dur_sec}s{boost_label}"
         )
-        publish_audit_log(
-            zone_id=state.zone_cfg.zone_id,
-            zone_name=state.zone_cfg.zone_name,
-            severity="INFO",
-            alert_type="IRRIGATION_EVENT",
-            actor="SCHEDULE",
-            message=(
-                f"Schedule triggered for zone {state.zone_cfg.zone_name or state.zone_cfg.zone_id}: "
-                f"slot_id={slot.slot_id}, schedule_id={slot.schedule_id or 'n/a'}, "
-                f"duration={dur_sec}s{', soil below threshold — priority boosted' if below_threshold else ''}"
-            ),
-        )
+        # Start irrigation FIRST so pump turns on with minimum delay,
+        # then publish the audit log (HTTP) without blocking the pump start.
         start_irrigation("SCHEDULE", dur_sec, started_ts=scheduled_ts, effective_priority=effective_priority)
+        try:
+            publish_audit_log(
+                zone_id=state.zone_cfg.zone_id,
+                zone_name=state.zone_cfg.zone_name,
+                severity="INFO",
+                alert_type="IRRIGATION_EVENT",
+                actor="SCHEDULE",
+                message=(
+                    f"Schedule triggered for zone {state.zone_cfg.zone_name or state.zone_cfg.zone_id}: "
+                    f"slot_id={slot.slot_id}, schedule_id={slot.schedule_id or 'n/a'}, "
+                    f"duration={dur_sec}s{', soil below threshold — priority boosted' if below_threshold else ''}"
+                ),
+            )
+        except Exception as exc:
+            print("Schedule audit log error (non-fatal):", exc)
     except Exception as exc:
         print("run_schedule_logic error:", exc)
 
@@ -1393,67 +1528,114 @@ def process_device_status():
 
 
 def send_to_adafruit_if_due():
+    """Push changed sensor values and pump-state events to Adafruit.
+
+    Rules (all must pass before any aio.send is issued):
+    1. Not in throttle window (ThrottlingError backoff).
+    2. Min AIO_MIN_SEND_INTERVAL_SEC gap since last batch (default 3 s).
+    3. Only send a feed when its value has changed vs the last sent value:
+       - TEMP / HUMI : any change
+       - SOIL        : change ≥ SOIL_SEND_MIN_DELTA % (default 2)
+       - PUMP        : only on gateway-triggered state change (pump_feed_dirty flag)
+    4. AIO_FEED_DELAY_SEC pause (default 0.2 s) between individual sends
+       to stay under Adafruit’s per-second request cap.
+    """
     if state.latest_data is None:
         return
     now_ts = time.time()
 
-    # PUMP is only published to Adafruit when an AUTO/SCHEDULE/AI pump event fires
-    # (start or stop).  The flag is set exactly then and consumed once here.
-    # Regular interval/change sends (TEMP/HUMI/SOIL) never carry PUMP.
-    publish_pump_now = state.pump_feed_dirty
-
-    # Change-detection: never trigger on PUMP so device telemetry PUMP changes
-    # don't cause premature sends or Adafruit feedback loops.
-    keys_to_check = ["TEMP", "HUMI", "SOIL", "PUMP"]
-    keys_for_change = ["TEMP", "HUMI", "SOIL"]
-
-    # detect change vs last sent data
-    changed = False
-    if SEND_IMMEDIATE_ON_CHANGE:
-        for k in keys_for_change:
-            if k in state.latest_data:
-                prev = state.last_sent_data.get(k)
-                curr = state.latest_data.get(k)
-                if prev is None or str(prev) != str(curr):
-                    changed = True
-                    break
-
-    # if nothing changed, no pump event, and interval hasn't elapsed, skip
-    if (not changed) and (not publish_pump_now) and (now_ts - state.last_send_time < SEND_INTERVAL_SEC):
+    # Rule 1: throttle backoff
+    if now_ts < state.aio_throttle_until:
+        remaining = state.aio_throttle_until - now_ts
+        _warn("throttle_remain", f"[THROTTLE] Adafruit paused {remaining:.0f}s remaining")
         return
 
+    # Rule 2: minimum interval between batches
+    if now_ts - state.last_send_time < AIO_MIN_SEND_INTERVAL_SEC and not state.pump_feed_dirty:
+        return
+
+    # Rule 3: per-feed change detection
+    feeds_to_send: list = []  # [(feed_key, value, state_key)]
+
+    if "TEMP" in state.latest_data:
+        curr = state.latest_data["TEMP"]
+        if state.last_sent_data.get("TEMP") != curr:
+            feeds_to_send.append((FEED_TEMP, curr, "TEMP"))
+
+    if "HUMI" in state.latest_data:
+        curr = state.latest_data["HUMI"]
+        if state.last_sent_data.get("HUMI") != curr:
+            feeds_to_send.append((FEED_HUM, curr, "HUMI"))
+
+    if "SOIL" in state.latest_data:
+        curr_soil = int(state.latest_data["SOIL"])
+        prev_soil = state.last_sent_data.get("SOIL")
+        if prev_soil is None or abs(curr_soil - int(prev_soil)) >= SOIL_SEND_MIN_DELTA:
+            feeds_to_send.append((FEED_SOIL, curr_soil, "SOIL"))
+
+    # PUMP: only on gateway-triggered state change
+    send_pump = state.pump_feed_dirty
+
+    if not feeds_to_send and not send_pump:
+        return
+
+    # Also enforce min interval even when sensors changed
+    if feeds_to_send and now_ts - state.last_send_time < AIO_MIN_SEND_INTERVAL_SEC:
+        feeds_to_send = []  # defer sensors; pump event may still proceed
+        if not send_pump:
+            return
+
     try:
-        print("Sending to Adafruit...", "(changed)" if changed else "(pump event)" if publish_pump_now else "(interval)")
-        if "TEMP" in state.latest_data:
-            aio.send(FEED_TEMP, state.latest_data["TEMP"])
-        if "HUMI" in state.latest_data:
-            aio.send(FEED_HUM, state.latest_data["HUMI"])
-        if "SOIL" in state.latest_data:
-            aio.send(FEED_SOIL, state.latest_data["SOIL"])
-        if publish_pump_now and "PUMP" in state.latest_data:
-            aio.send(FEED_PUMP_STATE, state.latest_data["PUMP"])
+        changed_keys = [k for _, _, k in feeds_to_send]
+        reason_parts = []
+        if feeds_to_send:
+            reason_parts.append(f"changed({','.join(changed_keys)})")
+        if send_pump:
+            reason_parts.append("pump event")
+        print("Sending to Adafruit...", " + ".join(reason_parts))
+
+        sent_count = 0
+        for feed_key, value, state_key in feeds_to_send:
+            if sent_count > 0:
+                time.sleep(AIO_FEED_DELAY_SEC)  # pace requests
+            aio.send(feed_key, value)
+            state.last_sent_data[state_key] = value
+            sent_count += 1
+
+        if send_pump and "PUMP" in state.latest_data:
+            if sent_count > 0:
+                time.sleep(AIO_FEED_DELAY_SEC)
+            pump_val = int(state.latest_data["PUMP"])
+            aio.send(FEED_PUMP_STATE, pump_val)
             state.pump_feed_dirty = False  # consumed
-        state.last_send_time = now_ts
-        # snapshot last sent (always track PUMP for dedup even if not published)
-        state.last_sent_data = {k: state.latest_data.get(k) for k in keys_to_check if k in state.latest_data}
-        # After sending telemetry, update devices' last-active timestamps in backend
-        try:
-            devices_payload: Dict[str, str] = {}
-            for dev in DEVICE_KEYS:
-                ts = state.device_last_seen.get(dev) or state.last_send_time
-                devices_payload[dev] = datetime.fromtimestamp(ts, UTC).isoformat().replace("+00:00", "Z")
-            backend.update_devices_last_active(state.zone_cfg.zone_id, devices_payload)
-        except Exception:
-            # don't fail the main loop if updating last-active fails
-            pass
-        print("Send OK")
-        print("===============")
+            state.last_pump_send_time = now_ts
+            state.last_sent_data["PUMP"] = pump_val
+            state.last_pump_state_write_time = now_ts
+            state.last_pump_state_write_value = pump_val
+            sent_count += 1
+
+        if sent_count > 0:
+            state.last_send_time = now_ts
+            # Update devices' last-active timestamps in backend
+            try:
+                devices_payload: Dict[str, str] = {}
+                for dev in DEVICE_KEYS:
+                    ts = state.device_last_seen.get(dev) or now_ts
+                    devices_payload[dev] = datetime.fromtimestamp(ts, UTC).isoformat().replace("+00:00", "Z")
+                backend.update_devices_last_active(state.zone_cfg.zone_id, devices_payload)
+            except Exception:
+                pass
+            print(f"Send OK ({sent_count} feed(s))")
+            print("===============")
+
     except ThrottlingError:
-        print("Adafruit throttling: gui qua nhanh")
-        time.sleep(5)
+        # Do NOT sleep — control loop must keep running.
+        state.aio_throttle_until = time.time() + 65
+        if send_pump:
+            state.pump_feed_dirty = True  # retry after backoff
+        print("[THROTTLE] Adafruit rate limit hit; all aio calls paused for 65 s")
     except Exception as exc:
         print("Send error:", exc)
-        time.sleep(0.5)
 
 
 def handle_device_event(parsed: Dict[str, Any]) -> None:
@@ -1490,6 +1672,19 @@ def handle_device_event(parsed: Dict[str, Any]) -> None:
                     )
 
         elif etype == "STOP":
+            # If the gateway owns a PROFILE session, the soil-threshold check
+            # (run_auto_logic) is the ONLY authority to stop irrigation.
+            # Ignore any STOP events the ESP32 emits on its own (e.g. its own
+            # hardware timer expiring) to prevent the ON/OFF cycling loop:
+            #   ESP32 emits STOP → gateway stops → soil still low → gateway
+            #   restarts → ESP32 emits STOP again → …
+            if state.active_trigger == "PROFILE":
+                print("[PROFILE] Ignoring ESP32 STOP event — PROFILE stop is soil-controlled")
+                # Still update pump_is_on from the PUMP telemetry field if present;
+                # but do NOT call stop_irrigation() so the active_trigger stays
+                # intact and run_auto_logic() keeps the pump going.
+                return
+
             start_ts = parsed.get("EVENT_START_TS") or state.current_watering_started_at or (ets - (parsed.get("EVENT_DUR") or 0))
             if state.suppress_device_audit:
                 state.current_watering_started_at = start_ts
@@ -1659,8 +1854,17 @@ while True:
     except Exception:
         pass
 
-    # Keep blocking backend refresh after real-time control so schedule on/off is not delayed by HTTP.
-    refresh_zone_config()
+    # Config refresh strategy:
+    # • SCHEDULE: skip during active irrigation (duration-based, no live thresholds needed);
+    #             force every 5× interval so deletions propagate.
+    # • PROFILE:  refresh every CONFIG_REFRESH_SEC normally so web min/max changes
+    #             propagate within one cycle (soil-based stop needs current thresholds).
+    # • All others: refresh at normal rate.
+    if state.pump_is_on and state.active_trigger == "SCHEDULE":
+        if time.time() - state.last_config_refresh > CONFIG_REFRESH_SEC * 5:
+            refresh_zone_config()  # emergency refresh only
+    else:
+        refresh_zone_config()  # normal rate for PROFILE, MANUAL, idle
 
     send_to_adafruit_if_due()
     time.sleep(0.02)
