@@ -314,6 +314,21 @@ class BackendClient:
                 return None
         return None
 
+    def _patch(self, path: str, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        response = self.session.patch(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload),
+            timeout=10,
+            allow_redirects=False,
+        )
+        response.raise_for_status()
+        if response.text:
+            try:
+                return response.json()
+            except Exception:
+                return None
+        return None
+
     @staticmethod
     def _unwrap(data: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(data, dict) and isinstance(data.get("data"), dict):
@@ -416,51 +431,26 @@ class BackendClient:
             print("AI irrigation response parse error:", exc)
             return None
 
-    def update_devices_last_active(self, zone_id: str, devices: Dict[str, str]) -> None:
-        """Update last active timestamps for devices in the backend.
-
-        payload example: { "zoneId": "zone1", "devices": {"TEMP": "2026-04-16T...Z", ...} }
-        """
-        # If base_url is not configured, skip
+    def fetch_zone_devices(self, zone_id: str) -> List[Dict[str, Any]]:
+        """GET /api/devices?zoneId={zone_id} to fetch devices for the zone."""
         if not self.base_url:
-            return
-
-        payload = {"zoneId": zone_id, "devices": devices}
-        url = f"{self.base_url}/api/devices/last-active"
-        # try POST/PUT/PATCH; if server disallows all, fall back to GET with query params
+            return []
         try:
-            methods = ["post", "put", "patch"]
-            did_call = False
-            for m in methods:
-                func = getattr(self.session, m)
-                resp = func(url, data=json.dumps(payload), timeout=10)
-                did_call = True
-                # if server returns 405, try next method
-                if resp.status_code == 405:
-                    continue
-                # successful (or other error) -> raise if error, otherwise we're done
-                resp.raise_for_status()
-                print(f"Update devices last active via {m.upper()} OK")
-                return
-
-            # if we reach here and we've tried HTTP methods but all were 405, try GET fallback
-            if did_call:
-                params = {"zoneId": zone_id}
-                params.update(devices)
-                resp = self.session.get(url, params=params, timeout=10)
-                resp.raise_for_status()
-                print("Update devices last active via GET OK")
-                return
+            return self._unwrap(self._get(f"/api/devices?zoneId={zone_id}"))
         except Exception as exc:
-            # If API doesn't expose this endpoint, quietly ignore 404 to avoid noisy logs
-            try:
-                resp = getattr(exc, 'response', None)
-                if resp is not None and getattr(resp, 'status_code', None) == 404:
-                    # endpoint not found on this backend; skip without error
-                    return
-            except Exception:
-                pass
-            print("Update devices last active error:", exc)
+            print(f"Failed to fetch zone devices for {zone_id}:", exc)
+            return []
+
+    def update_device_status(self, device_id: str, status: str) -> None:
+        """PATCH /api/devices/{device_id} with {"status": status}"""
+        if not self.base_url or not device_id:
+            return
+        payload = {"status": status}
+        try:
+            self._patch(f"/api/devices/{device_id}", payload)
+            # print(f"Device {device_id} status updated to {status}")
+        except Exception as exc:
+            print(f"Update device {device_id} status error:", exc)
 
 # ==========================================================
 # EMAIL
@@ -496,6 +486,7 @@ class GatewayState:
         self.last_config_refresh = 0.0
         # per-device last seen timestamps (epoch seconds)
         self.device_last_seen: Dict[str, float] = {k: 0.0 for k in DEVICE_KEYS}
+        self.device_ids: Dict[str, str] = {}
         self.pump_is_on = False
         self.active_trigger: Optional[str] = None
         self.current_watering_started_at: Optional[float] = None
@@ -883,6 +874,25 @@ def refresh_zone_config(force: bool = False):
         new_cfg = backend.fetch_zone_config(state.zone_id)
         state.zone_cfg = new_cfg
         state.last_config_refresh = time.time()
+
+        try:
+            devices_info = backend.fetch_zone_devices(state.zone_id)
+            new_ids = {}
+            type_map = {
+                "DHT20_TEMPERATURE_SENSOR": "TEMP",
+                "DHT20_HUMIDITY_SENSOR": "HUMI",
+                "SOIL_MOISTURE_SENSOR": "SOIL",
+                "RELAY_MODULE": "PUMP",
+                "ESP32": "ESP32"
+            }
+            for d in devices_info:
+                dt = d.get("deviceType")
+                did = d.get("id")
+                if dt in type_map and did:
+                    new_ids[type_map[dt]] = did
+            state.device_ids = new_ids
+        except Exception as exc:
+            print("Fetch devices error:", exc)
 
         # If requested, ensure a local forced schedule exists (user-requested)
         try:
@@ -1526,6 +1536,13 @@ def process_device_status():
             )
             state.device_offline_logged[dev] = True
 
+            dev_id = state.device_ids.get(dev)
+            if dev_id:
+                try:
+                    backend.update_device_status(dev_id, "OFFLINE")
+                except Exception as exc:
+                    print(f"Failed to set {dev} offline:", exc)
+
 
 def send_to_adafruit_if_due():
     """Push changed sensor values and pump-state events to Adafruit.
@@ -1616,15 +1633,17 @@ def send_to_adafruit_if_due():
 
         if sent_count > 0:
             state.last_send_time = now_ts
-            # Update devices' last-active timestamps in backend
+            # Update devices' status to ACTIVE in backend
             try:
-                devices_payload: Dict[str, str] = {}
                 for dev in DEVICE_KEYS:
-                    ts = state.device_last_seen.get(dev) or now_ts
-                    devices_payload[dev] = datetime.fromtimestamp(ts, UTC).isoformat().replace("+00:00", "Z")
-                backend.update_devices_last_active(state.zone_cfg.zone_id, devices_payload)
-            except Exception:
-                pass
+                    # Only mark active if we have recently seen it
+                    ts = state.device_last_seen.get(dev, 0)
+                    if now_ts - ts < DEVICE_OFFLINE_SEC:
+                        dev_id = state.device_ids.get(dev)
+                        if dev_id:
+                            backend.update_device_status(dev_id, "ACTIVE")
+            except Exception as e:
+                print("Update devices active error:", e)
             print(f"Send OK ({sent_count} feed(s))")
             print("===============")
 
