@@ -5,6 +5,7 @@ import re
 import serial
 import requests
 import smtplib
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, UTC, timezone, timedelta
 VN_TZ = timezone(timedelta(hours=7))
@@ -545,6 +546,7 @@ class GatewayState:
         self.aio_throttle_until: float = 0.0
         self.manual_suppress_auto_until: float = 0.0
         self.profile_cancelled_until_recovery: bool = False
+        self.dht_error_logged = False
 
     def mark_device_seen(self, device: str):
         """Record that a given device (e.g. 'TEMP') was seen now."""
@@ -1933,6 +1935,24 @@ def apply_parsed_telemetry(data: Dict[str, Any], prev_pump_state: bool) -> bool:
             state.mark_device_seen(key)
     
     # --- Check for Sensor Errors (e.g. disconnected) ---
+    temp = state.latest_data.get("TEMP")
+    humi = state.latest_data.get("HUMI")
+    
+    if (temp is not None and math.isnan(temp)) or (humi is not None and math.isnan(humi)):
+        if not state.dht_error_logged:
+            publish_audit_log(
+                zone_id=state.zone_cfg.zone_id,
+                zone_name=state.zone_cfg.zone_name,
+                severity="WARNING",
+                alert_type="IRRIGATION_EVENT",
+                actor="SYSTEM",
+                message=f"DHT Sensor Error: temperature or humidity reported NAN (check wiring) in zone {state.zone_cfg.zone_name or state.zone_cfg.zone_id}"
+            )
+            state.dht_error_logged = True
+    else:
+        if temp is not None and humi is not None:
+            state.dht_error_logged = False
+
     soil_raw = safe_int(data.get("RAW"), -1)
     if soil_raw == 0 or soil_raw >= 4090:
          _warn(
