@@ -66,6 +66,8 @@ public:
 
     if (isnan(h) || isnan(t)) {
       Serial.println("DHT error");
+      temperature = NAN;
+      humidity = NAN;
       valid = false;
       return;
     }
@@ -427,7 +429,7 @@ public:
     if (dhtUpdated && !dht->isValid()) {
       display->show("DHT read error", "Check sensor");
       alertBlinkEnabled = true;
-      return;
+      // Do not return; continue so we send NAN to gateway for detection
     }
 
     float temp = dht->getTemp();

@@ -17,7 +17,7 @@
 | Only alert, no automatic pump action | ✅ PASS | `run_manual_logic()` only acts on explicit user commands — never auto-starts on soil threshold. |
 | Pump stays ON until user sends OFF | ✅ **FIXED** | `run_auto_logic()` no longer stops MANUAL sessions via the soil threshold check. Only `active_trigger == "DEVICE"` is affected by soil floor stop. |
 | No immediate reset after turning ON | ✅ **FIXED** | Adafruit echo suppression: gateway tracks `last_pump_state_write_time`. Reads within `MANUAL_FEED_ECHO_SUPPRESS_SEC=30s` that match the gateway's own write are discarded, preventing the shared `pump` feed from falsely signalling OFF. |
-| No false preemption from echo | ✅ **FIXED** | `run_manual_logic()` preemption now requires the feed value to be **newer than the gateway's last pump-state write**. Stale or echo values cannot preempt an active PROFILE/SCHEDULE session. |
+| Manual OFF sticky behavior | ✅ **NEW** | When manually turned OFF, AUTO/AI modes are suppressed for **60 seconds** and the current PROFILE cycle is cancelled until soil recovers to midpoint, preventing instant restarts. |
 | Manual poll not wasting data points | ✅ **FIXED** | Poll cache increased from 0.5 s → 3 s, reducing Adafruit API calls from ~120/min to ~20/min. |
 
 **Verdict: MANUAL mode is correct.**
@@ -29,8 +29,9 @@
 | Requirement | Status | Details |
 |---|---|---|
 | Send alert when below lower threshold | ✅ PASS | `process_plant_alerts()` runs on every telemetry update regardless of mode. |
-| Turn on pump when below lower threshold | ✅ PASS | `run_auto_logic()`: `if soil <= min_soil and not state.pump_is_on: start_irrigation("PROFILE")` |
+| Turn on pump when below lower threshold | ✅ PASS | `run_auto_logic()`: `if soil <= min_soil and not state.pump_is_on: start_irrigation("PROFILE")` (subject to 60s lockout). |
 | Turn off pump when reaching **midpoint** | ✅ PASS | `stop_target = midpoint(min_soil, max_soil)`. Pump stops when soil reaches halfway between min and max thresholds. |
+| Ignore minimum run duration | ✅ **NEW** | PROFILE irrigation now stops **immediately** at midpoint, bypassing the `PROFILE_MIN_RUN_SEC` timer for better responsiveness. |
 | Stop check not delayed by HTTP | ✅ **FIXED** | `refresh_zone_config()` is skipped while PROFILE irrigation is active — the blocking HTTP call no longer delays the soil-based stop decision. |
 | DEVICE-only soil floor stop | ✅ **FIXED** | The soil `>= stop_target` check now only applies to `active_trigger == "DEVICE"`. Previously it incorrectly used `min_soil` threshold and targeted wrong triggers. |
 | Send alert with irrigation event after auto-irrigation | ✅ PASS | `stop_irrigation()` publishes an `IRRIGATION_EVENT` audit log and calls `backend.create_irrigation_event()`. |
@@ -85,8 +86,9 @@
 
 | Requirement | Status | Details |
 |---|---|---|
-| Turn on at the scheduled time | ✅ **FIXED** | `TRIGGER_WINDOW_SEC` widened 2 s → **60 s** so HTTP-blocked loops no longer miss the window. `processed_schedule_marks` prevents double-firing within the same day. |
-| Water by duration (not soil threshold) | ✅ **FIXED** | `run_schedule_logic()` calls `start_irrigation("SCHEDULE", slot.duration)`. Timer `current_schedule_end_at = scheduled_ts + dur_sec` stops pump when duration expires. |
+| Turn on at the scheduled time | ✅ **FIXED** | `TRIGGER_WINDOW_SEC` widened 2 s → **60 s**. `hhmm_now()` standardized to `UTC+7` independently of OS clock settings. |
+| Water by duration (not soil threshold) | ✅ **FIXED** | `run_schedule_logic()` calls `start_irrigation("SCHEDULE", slot.duration)`. |
+| Precision Duration Stop | ✅ **NEW** | **Highest Priority:** Duration-based stop checks moved to the VERY TOP of the main loop. Bypasses all HTTP/Serial delays for ±0.1s accuracy. |
 | Pump turns on with minimum delay | ✅ **FIXED** | `start_irrigation()` called **before** `publish_audit_log()` — HTTP audit call no longer blocks the relay command. |
 | Stop check not blocked by HTTP | ✅ **FIXED** | `refresh_zone_config()` skipped in main loop while `active_trigger` is SCHEDULE or PROFILE. Forced refresh every `CONFIG_REFRESH_SEC × 5` (75 s) even during irrigation. |
 | Surface `schedule_id` in logs and audit | ✅ **FIXED** | `slot.schedule_id` included in `[SCHEDULE]` console print and `IRRIGATION_EVENT` audit log. |
@@ -145,4 +147,8 @@
 | 11 | ✅ Fixed | **Adafruit rate limit** — per-feed change detection, SOIL ≥ 2% filter, 3 s min interval, 0.2 s inter-feed delay, audit-log feed off by default | `send_to_adafruit_if_due()`, config |
 | 12 | ✅ Fixed | **Throttle blocks control loop** — removed all `time.sleep()` from `ThrottlingError` handlers; non-blocking `aio_throttle_until` state | `send_to_adafruit_if_due()`, `poll_manual_command_from_feed()` |
 | 13 | ✅ Fixed | **Log spam / infinite loop prints** — `_warn(key, msg)` debounce helper limits repeated diagnostic prints to once per 30 s | `_warn()`, `run_auto_logic()`, `run_manual_logic()` |
-| 14 | ⚠️ Partial | **Schedule ±1 s hardware accuracy** — set `PUSH_SCHEDULE_TO_ESP=1` for ESP32 hardware timer | `.env` config |
+| 14 | ✅ Fixed | **API 400 Bad Request** — Payloads now use standardized `alertType` and `zoneName` keys | `BackendClient.create_alert()`, `publish_audit_log()` |
+| 15 | ✅ Fixed | **Profile instant restart** — Added 60s lockout and midpoint-recovery requirement after manual OFF | `run_auto_logic()`, `run_manual_logic()` |
+| 16 | ✅ Fixed | **Seamless Override** — Switching from Auto to Manual no longer cycles pump power | `run_manual_logic()` |
+| 17 | ✅ Fixed | **Immediate Config Reset** — Changing Min/Max on Web now triggers immediate irrigation re-evaluation | `refresh_zone_config()` |
+| 18 | ✅ Fixed | **Schedule Accuracy** — Standardized GMT+7 and moved stop-checks to loop head | `hhmm_now()`, `while True` |

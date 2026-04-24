@@ -6,7 +6,8 @@ import serial
 import requests
 import smtplib
 from dataclasses import dataclass, field
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timezone, timedelta
+VN_TZ = timezone(timedelta(hours=7))
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
@@ -21,7 +22,7 @@ from Adafruit_IO import Client
 from Adafruit_IO.errors import ThrottlingError
 
 # ==========================================================
-# CONFIG
+# 1. ENVIRONMENT & CONFIGURATION
 # ==========================================================
 AIO_USERNAME = os.getenv("AIO_USERNAME", "")
 AIO_KEY = os.getenv("AIO_KEY", "")
@@ -34,9 +35,6 @@ FEED_PUMP_CMD = os.getenv("FEED_PUMP_CMD", FEED_PUMP)
 FEED_PUMP_STATE = os.getenv("FEED_PUMP_STATE", FEED_PUMP)
 MANUAL_FEED_ECHO_SUPPRESS_SEC = float(os.getenv("MANUAL_FEED_ECHO_SUPPRESS_SEC", "30.0"))
 FEED_AUDIT = os.getenv("FEED_AUDIT", "audit-log")
-# Set AIO_AUDIT_FEED_ENABLED=1 to also publish audit events to the Adafruit audit-log feed.
-# Disabled by default because each event consumes a data point and can cause throttling.
-# All audit events still go to the backend API regardless of this setting.
 AIO_AUDIT_FEED_ENABLED = str(os.getenv("AIO_AUDIT_FEED_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on")
 
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM4")
@@ -128,7 +126,14 @@ def now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 def hhmm_now() -> str:
-    return datetime.now().strftime("%H:%M")
+    # Get Vietnam time (GMT+7) regardless of local OS settings
+    # time.gmtime() is UTC, so we add 7 hours
+    vn_time = time.gmtime(time.time() + 7 * 3600)
+    return time.strftime("%H:%M", vn_time)
+
+def hms_now() -> str:
+    vn_time = time.gmtime(time.time() + 7 * 3600)
+    return time.strftime("%H:%M:%S", vn_time)
 
 def weekday_name_now() -> str:
     return datetime.now().strftime("%A")
@@ -254,7 +259,7 @@ TRIGGER_PRIORITY: Dict[str, int] = {
 }
 
 # ==========================================================
-# DATA MODELS
+# 2. DATA MODELS
 # ==========================================================
 @dataclass
 class TimeSlot:
@@ -284,7 +289,7 @@ class ZoneConfig:
     manual_pump_on: Optional[bool] = None
 
 # ==========================================================
-# BACKEND CLIENT
+# 3. BACKEND & DATABASE INTERACTION (API)
 # ==========================================================
 class BackendClient:
     def __init__(self, base_url: str, token: str = ""):
@@ -389,14 +394,16 @@ class BackendClient:
             manual_pump_on=manual_pump_on,
         )
 
-    def create_alert(self, *, zone_id: Optional[str], message: str, severity: str, alert_type: str, actor: str) -> None:
+    def create_alert(self, *, zone_id: Optional[str], zone_name: str, message: str, severity: str, alert_type: str, actor: str) -> None:
+        # Standardized payload based on successful irrigation-events API
         payload = {
             "type": alert_type,
-            "actor": actor,
             "message": message,
             "severity": severity,
             "zoneId": zone_id,
+            "actor": actor
         }
+        print(f"[DEBUG] Sending alert payload: {json.dumps(payload)}")
         self._post("/api/alerts", payload)
 
     def create_irrigation_event(self, *, zone_id: str, start_time: str, end_time: Optional[str] = None, duration: Optional[int] = None) -> None:
@@ -432,28 +439,36 @@ class BackendClient:
             return None
 
     def fetch_zone_devices(self, zone_id: str) -> List[Dict[str, Any]]:
-        """GET /api/devices?zoneId={zone_id} to fetch devices for the zone."""
+        """Fetch devices for the zone using the verified endpoint: /api/zones/{id}/devices"""
         if not self.base_url:
             return []
+        
         try:
-            return self._unwrap(self._get(f"/api/devices?zoneId={zone_id}"))
+            return self._get(f"/api/zones/{zone_id}/devices")
         except Exception as exc:
-            print(f"Failed to fetch zone devices for {zone_id}:", exc)
+            print(f"Failed to fetch zone devices: {exc}")
             return []
 
-    def update_device_status(self, device_id: str, status: str) -> None:
-        """PATCH /api/devices/{device_id} with {"status": status}"""
+    def update_device_status(self, device_id: str, status: Optional[str] = None, last_active_at: Optional[str] = None) -> None:
+        """PATCH /api/devices/{device_id} with status and/or lastActiveAt"""
         if not self.base_url or not device_id:
             return
-        payload = {"status": status}
+        payload = {}
+        if status:
+            payload["status"] = status
+        if last_active_at:
+            payload["lastActiveAt"] = last_active_at
+            
+        if not payload:
+            return
+
         try:
             self._patch(f"/api/devices/{device_id}", payload)
-            # print(f"Device {device_id} status updated to {status}")
         except Exception as exc:
             print(f"Update device {device_id} status error:", exc)
 
 # ==========================================================
-# EMAIL
+# 4. ALERTS & NOTIFICATIONS
 # ==========================================================
 def send_email(subject: str, body: str):
     if not (GMAIL_SENDER and GMAIL_APP_PASSWORD and GMAIL_RECEIVER):
@@ -474,7 +489,7 @@ def send_email(subject: str, body: str):
         print("Email error:", exc)
 
 # ==========================================================
-# GATEWAY STATE
+# 5. GATEWAY STATE MANAGEMENT
 # ==========================================================
 class GatewayState:
     def __init__(self, zone_id: str):
@@ -483,9 +498,12 @@ class GatewayState:
         self.latest_data: Optional[Dict[str, Any]] = None
         self.last_send_time = 0.0
         self.last_alert_time = 0.0
-        self.last_config_refresh = 0.0
+        self.last_config_refresh = time.time()
+        self.last_status_update = 0.0
         # per-device last seen timestamps (epoch seconds)
         self.device_last_seen: Dict[str, float] = {k: 0.0 for k in DEVICE_KEYS}
+        # per-device last backend sync (lastActiveAt) timestamps
+        self.device_last_backend_sync: Dict[str, float] = {k: 0.0 for k in DEVICE_KEYS}
         self.device_ids: Dict[str, str] = {}
         self.pump_is_on = False
         self.active_trigger: Optional[str] = None
@@ -505,47 +523,36 @@ class GatewayState:
         self.stop_above_count: int = 0
         # ignore short pump telemetry OFF transitions that occur immediately after we commanded ON
         self.ignore_pump_off_until: float = 0.0
-        # per-device offline logged flags
         self.device_offline_logged: Dict[str, bool] = {k: False for k in DEVICE_KEYS}
-            # last telemetry values sent to Adafruit/backend
         self.last_sent_data: Dict[str, Any] = {}
         self.last_manual_command: Optional[int] = None
         self.last_manual_poll_time: float = 0.0
         self.last_manual_feed_value: Optional[int] = None
         self.last_manual_command_at: float = 0.0
         self.pending_manual_state: Optional[int] = None
-        # Age (seconds) of the last successfully read Adafruit feed value.
-        # Initialized to infinity so startup never treats an old feed value as fresh.
         self.last_manual_feed_age_sec: float = float("inf")
-        # AI mode state
-        self.last_ai_call_time: float = 0.0          # epoch of last successful AI API call
-        self.ai_scheduled_start: Optional[float] = None   # epoch when AI wants pump to start
-        self.ai_duration_sec: Optional[int] = None   # AI-prescribed run duration
-        # Set True only when AUTO/SCHEDULE/AI changes pump state; consumed once by
-        # send_to_adafruit_if_due then cleared. MANUAL never sets this flag.
+        self.current_manual_feed_ts: float = 0.0
+        self.last_processed_manual_feed_ts: float = float("inf")
+        self.last_processed_manual_feed_value: Optional[int] = None
+        self.last_processed_web_manual: Optional[bool] = None
+        self.last_ai_call_time: float = 0.0          
+        self.ai_scheduled_start: Optional[float] = None   
+        self.ai_duration_sec: Optional[int] = None   
         self.pump_feed_dirty: bool = False
-        # Initialise to now so the very first send_to_adafruit_if_due() call
-        # does NOT immediately publish a stale PUMP=0 before ESP32 confirms state.
         self.last_pump_send_time: float = time.time()
-        # Echo-suppression: track the last pump-state value the gateway wrote to
-        # FEED_PUMP_STATE so poll_manual_command_from_feed() can discard reads
-        # that are merely our own echo (when FEED_PUMP_CMD == FEED_PUMP_STATE).
         self.last_pump_state_write_time: float = 0.0
         self.last_pump_state_write_value: Optional[int] = None
-        # Non-blocking Adafruit throttle management.
-        # When a ThrottlingError is received, set this to the future epoch when
-        # the rate-limit window resets.  All aio calls check this first and skip
-        # rather than blocking the control loop with time.sleep().
         self.aio_throttle_until: float = 0.0
+        self.manual_suppress_auto_until: float = 0.0
+        self.profile_cancelled_until_recovery: bool = False
 
     def mark_device_seen(self, device: str):
-        """Record that a given device (e.g. 'TEMP') was seen now.
-
-        If that device was previously logged offline, emit an INFO audit.
-        """
+        """Record that a given device (e.g. 'TEMP') was seen now."""
         now_ts = time.time()
+        was_offline = self.device_offline_logged.get(device, False)
         self.device_last_seen[device] = now_ts
-        if self.device_offline_logged.get(device):
+        
+        if was_offline:
             publish_audit_log(
                 zone_id=self.zone_cfg.zone_id,
                 zone_name=self.zone_cfg.zone_name,
@@ -555,6 +562,26 @@ class GatewayState:
                 message=f"{DEVICE_FRIENDLY.get(device, device)} is back online",
             )
             self.device_offline_logged[device] = False
+            
+            # Immediate status update to ONLINE
+            dev_id = self.device_ids.get(device)
+            if dev_id:
+                try:
+                    backend.update_device_status(dev_id, status="ONLINE", last_active_at=now_iso())
+                    self.device_last_backend_sync[device] = now_ts
+                except Exception:
+                    pass
+        else:
+            # Periodically update lastActiveAt (once every 30 seconds, matching Adafruit publish rate)
+            last_sync = self.device_last_backend_sync.get(device, 0)
+            if now_ts - last_sync >= 30.0:
+                dev_id = self.device_ids.get(device)
+                if dev_id:
+                    try:
+                        backend.update_device_status(dev_id, last_active_at=now_iso())
+                        self.device_last_backend_sync[device] = now_ts
+                    except Exception:
+                        pass
 
 # ==========================================================
 # CLIENTS
@@ -585,6 +612,7 @@ def publish_audit_log(*, zone_id: Optional[str], zone_name: str, severity: str, 
     try:
         backend.create_alert(
             zone_id=zone_id,
+            zone_name=zone_name,
             message=message,
             severity=severity,
             alert_type=alert_type,
@@ -618,7 +646,7 @@ def publish_audit_log(*, zone_id: Optional[str], zone_name: str, severity: str, 
         print("Send audit feed error:", exc)
 
 # ==========================================================
-# DEVICE COMMANDS
+# 6. SERIAL COMMUNICATION
 # ==========================================================
 def send_pump_command(value: int):
     cmd = f"!CMD=PUMP;VALUE={value}#\n"
@@ -645,7 +673,7 @@ def send_zone_to_esp():
         ser.write(cmd.encode("utf-8"))
         print("Sent zone to ESP32:", cmd.strip())
     except Exception as exc:
-        print("Send zone to ESP32 error:", exc)
+        print("Sent zone to ESP32 error:", exc)
 
 
 def send_schedule_to_esp():
@@ -700,8 +728,31 @@ def send_schedule_to_esp():
         print("Send schedule to ESP32 error:", exc)
 
 # ==========================================================
-# IRRIGATION ACTIONS
+# 7. IRRIGATION CONTROL
 # ==========================================================
+def publish_pump_state_immediate(value: int, reason: str = "") -> None:
+    """Publish pump state to Adafruit immediately for gateway-owned state changes."""
+    now_ts = time.time()
+    if now_ts < state.aio_throttle_until:
+        state.pump_feed_dirty = True
+        return
+    try:
+        aio.send(FEED_PUMP_STATE, int(value))
+        state.last_sent_data["PUMP"] = int(value)
+        state.last_pump_send_time = now_ts
+        state.last_pump_state_write_time = now_ts
+        state.last_pump_state_write_value = int(value)
+        state.pump_feed_dirty = False
+        print(f"[ADA] Published pump state={int(value)} immediately" + (f" ({reason})" if reason else ""))
+        time.sleep(AIO_FEED_DELAY_SEC)
+    except ThrottlingError:
+        state.aio_throttle_until = time.time() + 65
+        state.pump_feed_dirty = True
+        print("[THROTTLE] Immediate pump-state publish throttled; will retry later")
+    except Exception as exc:
+        state.pump_feed_dirty = True
+        print("Immediate pump-state publish error:", exc)
+
 def start_irrigation(trigger: str, duration_sec: Optional[int] = None, started_ts: Optional[float] = None, effective_priority: Optional[int] = None):
     # Priority check: higher-priority trigger can preempt a running lower-priority one.
     # effective_priority allows callers (e.g. schedule under low-soil condition) to
@@ -752,12 +803,44 @@ def start_irrigation(trigger: str, duration_sec: Optional[int] = None, started_t
     if trigger in ("PROFILE", "SCHEDULE", "AI"):
         state.pump_feed_dirty = True
 
+    # Publish gateway-owned ON state before commanding PROFILE/SCHEDULE/AI,
+    # so Adafruit/web shows pump=1 as soon as the auto process starts.
+    if trigger in ("PROFILE", "SCHEDULE", "AI"):
+        if state.latest_data is None:
+            state.latest_data = {}
+        state.latest_data["PUMP"] = 1
+        publish_pump_state_immediate(1, reason=f"{trigger} start")
+        # Small delay to ensure Adafruit receives the state before ESP32 starts the physical pump
+        time.sleep(0.5)
+
     # finally, command the pump ON
     send_pump_command(1)
-    # We intentionally do NOT publish a "start" irrigation event here.
-    # The system should only create a single irrigation event when the irrigation completes.
+    
+    # ── AUDIT LOGIC FOR START ────────────────────────────────────────────────
+    # Profile: Warning "Bắt đầu tưới"
+    if trigger == "PROFILE":
+        publish_audit_log(
+            zone_id=state.zone_cfg.zone_id,
+            zone_name=state.zone_cfg.zone_name,
+            severity="WARNING",
+            alert_type="PLANT_STATUS",
+            actor="SYSTEM",
+            message=f"Bắt đầu tưới (PROFILE) cho zone {state.zone_cfg.zone_name or state.zone_cfg.zone_id}"
+        )
+    # Manual: One irrigation event at START (User requirement: total 2 for manual)
+    elif trigger == "MANUAL":
+        publish_audit_log(
+            zone_id=state.zone_cfg.zone_id,
+            zone_name=state.zone_cfg.zone_name,
+            severity="INFO",
+            alert_type="IRRIGATION_EVENT",
+            actor="USER",
+            message=f"Manual irrigation started by user"
+        )
+    # Schedule: No start notification (per user requirement)
+    
     try:
-        print(f"[IRRIGATION] started by {trigger} for zone {state.zone_cfg.zone_name or state.zone_cfg.zone_id} (min_end_at={state.profile_min_end_at})")
+        print(f"[IRRIGATION] started by {trigger} for zone {state.zone_cfg.zone_name or state.zone_cfg.zone_id}")
     except Exception:
         pass
 
@@ -799,6 +882,16 @@ def stop_irrigation(reason: str, started_ts: Optional[float] = None, force: bool
     # Turn pump off if it appears to be on
     # Always attempt to send OFF command to device to ensure relay is turned off
     try:
+        if state.latest_data is None:
+            state.latest_data = {}
+        state.latest_data["PUMP"] = 0
+        
+        # Publish pump-off state to Adafruit first if this is a gateway-controlled session
+        if state.active_trigger in ("PROFILE", "SCHEDULE", "AI") or force:
+            publish_pump_state_immediate(0, reason=f"stop: {reason}")
+            # Small delay to ensure Adafruit receives the state before ESP32 kills the physical pump
+            time.sleep(0.5)
+            
         send_pump_command(0)
         print(f"[IRRIGATION] stop requested: {reason}")
     except Exception:
@@ -878,18 +971,24 @@ def refresh_zone_config(force: bool = False):
         try:
             devices_info = backend.fetch_zone_devices(state.zone_id)
             new_ids = {}
-            type_map = {
-                "DHT20_TEMPERATURE_SENSOR": "TEMP",
-                "DHT20_HUMIDITY_SENSOR": "HUMI",
-                "SOIL_MOISTURE_SENSOR": "SOIL",
-                "RELAY_MODULE": "PUMP",
-                "ESP32": "ESP32"
-            }
             for d in devices_info:
-                dt = d.get("deviceType")
+                # Use both 'type' and 'deviceType' just in case
+                raw_type = str(d.get("type") or d.get("deviceType") or "").upper()
                 did = d.get("id")
-                if dt in type_map and did:
-                    new_ids[type_map[dt]] = did
+                
+                dtype = None
+                if "TEMP" in raw_type or "TEMPERATURE" in raw_type:
+                    dtype = "TEMP"
+                elif "HUMI" in raw_type or "HUMIDITY" in raw_type:
+                    dtype = "HUMI"
+                elif "SOIL" in raw_type:
+                    dtype = "SOIL"
+                elif "PUMP" in raw_type or "RELAY" in raw_type:
+                    dtype = "PUMP"
+                
+                if dtype and did:
+                    new_ids[dtype] = did
+            
             state.device_ids = new_ids
         except Exception as exc:
             print("Fetch devices error:", exc)
@@ -938,18 +1037,20 @@ def refresh_zone_config(force: bool = False):
 
         if old_cfg.profile.min_soil != new_cfg.profile.min_soil or old_cfg.profile.max_soil != new_cfg.profile.max_soil:
             # publish_audit_log(
-            #     zone_id=new_cfg.zone_id,
-            #     zone_name=new_cfg.zone_name,
-            #     severity="INFO",
-            #     alert_type="PLANT_STATUS",
-            #     actor="SYSTEM",
-            #     message=f"Profile thresholds updated: min={new_cfg.profile.min_soil}%, max={new_cfg.profile.max_soil}%",
-            # )
+            # If pump is on, stop it immediately to re-evaluate with new thresholds
+            if state.pump_is_on:
+                print("[CONFIG] Profile thresholds changed, stopping pump to re-evaluate state")
+                stop_irrigation("profile thresholds updated - resetting state", force=True)
+
             if state.pump_is_on and state.latest_data is not None:
                 soil = safe_int(state.latest_data.get("SOIL"), 0)
-                stop_target = new_cfg.profile.max_soil
+                # Re-calculate stop target using midpoint
+                new_min = new_cfg.profile.min_soil
+                new_max = new_cfg.profile.max_soil
+                stop_target = midpoint(new_min, new_max)
+                
                 if state.active_trigger in ("PROFILE", None) and soil >= stop_target:
-                    stop_irrigation(f"profile changed and soil already >= profile max threshold {stop_target}%")
+                    stop_irrigation(f"profile changed and soil already >= new midpoint {stop_target}%")
 
         old_schedule_sig = [(slot.slot_id, slot.start_time, tuple(slot.days), slot.duration) for slot in old_cfg.time_slots]
         new_schedule_sig = [(slot.slot_id, slot.start_time, tuple(slot.days), slot.duration) for slot in new_cfg.time_slots]
@@ -977,16 +1078,10 @@ def refresh_zone_config(force: bool = False):
         )
 
 # ==========================================================
-# MODE LOGIC
+# 8. AUTOMATION LOGIC
 # ==========================================================
 def check_schedule_trigger() -> Optional[tuple[TimeSlot, float]]:
-    # Trigger window: how many seconds AFTER the scheduled start time we will
-    # still fire the slot.  Blocking HTTP calls (refresh_zone_config, Adafruit
-    # sends) can stall the main loop for several seconds, so 2 s was too tight
-    # and slots were silently missed.  60 s is safe because
-    # `processed_schedule_marks` (keyed {today}:{slot_id}) prevents the slot
-    # from firing more than once per day regardless of how wide this window is.
-    now_dt = datetime.now().astimezone()
+    now_dt = datetime.now(VN_TZ)
     current_day = now_dt.strftime("%A")
     today = now_dt.strftime("%Y-%m-%d")
     now_ts = time.time()
@@ -1008,7 +1103,9 @@ def check_schedule_trigger() -> Optional[tuple[TimeSlot, float]]:
             continue
 
         slot_key = slot.slot_id or f"{slot.start_time}-{slot.duration}-{','.join(slot.days)}"
-        mark = f"{today}:{slot_key}"
+        # Include start_time in the mark so that changing the time on the web
+        # allows the slot to be re-triggered on the same day.
+        mark = f"{today}:{slot_key}:{slot.start_time}"
         if state.processed_schedule_marks.get(mark):
             continue
 
@@ -1063,7 +1160,9 @@ def poll_manual_command_from_feed() -> Optional[bool]:
             created_at_str = getattr(pkt, "created_at", None)
             if created_at_str:
                 created_dt = datetime.fromisoformat(str(created_at_str).replace("Z", "+00:00"))
-                state.last_manual_feed_age_sec = now_ts - created_dt.timestamp()
+                feed_ts = created_dt.timestamp()
+                state.last_manual_feed_age_sec = now_ts - feed_ts
+                state.current_manual_feed_ts = feed_ts
             else:
                 state.last_manual_feed_age_sec = 0.0  # no timestamp → treat as fresh
         except Exception:
@@ -1089,16 +1188,54 @@ def run_manual_logic():
     (SCHEDULE, PROFILE/AUTO, AI) when the user explicitly commands the pump.
     """
     desired: Optional[bool] = None
-
-    if state.zone_cfg.manual_pump_on is not None:
-        desired = state.zone_cfg.manual_pump_on
+    is_new_manual_action = False
 
     feed_desired = poll_manual_command_from_feed()
+    web_desired = state.zone_cfg.manual_pump_on
+
+    # ── Initialization ────────────────────────────────────────────────────────
+    # On the very first loop, just record current values without acting.
+    # This prevents stale data at startup from triggering an unwanted action.
+    is_initializing = False
+    if state.last_processed_manual_feed_ts == float("inf"):
+        state.last_processed_manual_feed_ts = state.current_manual_feed_ts
+        is_initializing = True
+    if state.last_processed_manual_feed_value is None and feed_desired is not None:
+        state.last_processed_manual_feed_value = feed_desired
+        is_initializing = True
+    if state.last_processed_web_manual is None and web_desired is not None:
+        state.last_processed_web_manual = web_desired
+        is_initializing = True
+
+    if is_initializing:
+        return
+
+    # ── Change Detection ──────────────────────────────────────────────────────
+    if web_desired is not None:
+        desired = web_desired
+        if state.last_processed_web_manual != desired:
+            is_new_manual_action = True
+
     if feed_desired is not None:
         desired = feed_desired
+        if state.current_manual_feed_ts > state.last_processed_manual_feed_ts:
+            is_new_manual_action = True
+        elif state.last_processed_manual_feed_value is not None and desired != state.last_processed_manual_feed_value:
+            is_new_manual_action = True
 
     if desired is None:
         return
+
+    # If it's not a new explicit user action, do not process any manual logic.
+    if not is_new_manual_action:
+        return
+
+    # Update processed trackers so we don't treat it as new next time
+    if feed_desired is not None:
+        state.last_processed_manual_feed_ts = state.current_manual_feed_ts
+        state.last_processed_manual_feed_value = feed_desired
+    if state.zone_cfg.manual_pump_on is not None:
+        state.last_processed_web_manual = state.zone_cfg.manual_pump_on
 
     desired_value = 1 if desired else 0
 
@@ -1133,9 +1270,25 @@ def run_manual_logic():
                 f"last write ({write_age_sec:.0f}s ago) — echo, no preempt",
             )
             return
-        print(f"[MANUAL] Overriding active trigger '{state.active_trigger}' — taking manual control")
-        stop_irrigation("manual override", started_ts=state.current_watering_started_at, force=True)
-        # fall through to start block (pump_is_on will be False after stop)
+        
+        # Seamless transition: don't stop/restart the pump, just change the owner.
+        # CRITICAL: Only switch to MANUAL if the command is actually NEWER than
+        # when the current irrigation started. Otherwise it's a stale echo.
+        started_at = state.current_watering_started_at or 0
+        feed_ts = state.current_manual_feed_ts
+        
+        # Give 2 seconds margin for network/processing delay
+        if feed_ts <= (started_at + 2.0):
+             _warn(
+                "stale_override",
+                f"[MANUAL] Ignoring override command (ts={feed_ts:.1f}) that is not newer than "
+                f"irrigation start (ts={started_at:.1f}) — likely echo"
+            )
+             return
+
+        print(f"[MANUAL] Claiming active trigger '{state.active_trigger}' — switching to manual control (seamless)")
+        state.active_trigger = "MANUAL"
+        return
 
     if state.last_manual_command == desired_value and state.pump_is_on == desired:
         return
@@ -1171,12 +1324,19 @@ def run_manual_logic():
                 f"while {state.active_trigger} is active",
             )
             return
+        was_profile = state.active_trigger == "PROFILE"
         started_ts = state.current_watering_started_at
-        stop_irrigation("manual command off", started_ts=started_ts, force=True)
+        stop_irrigation("manual command off", started_ts=started_ts, force=True, actor="MANUAL")
+        if was_profile:
+            state.profile_cancelled_until_recovery = True
+            print("[PROFILE] Manual OFF cancelled current PROFILE cycle until soil reaches midpoint")
+        # Suppress AUTO/AI restarts briefly after manual OFF; PROFILE also has
+        # profile_cancelled_until_recovery to prevent restart while soil remains low.
+        state.manual_suppress_auto_until = time.time() + 60.0
         state.last_manual_command_at = time.time()
         state.pending_manual_state = 0
         state.last_manual_feed_value = 0
-        print("[MANUAL] Pump OFF requested from web")
+        print("[MANUAL] Pump OFF requested from web (auto suppressed for 60s)")
 
     state.last_manual_command = desired_value
     if state.pending_manual_state is None or state.pending_manual_state != desired_value:
@@ -1202,40 +1362,56 @@ def run_auto_logic():
     min_soil = state.zone_cfg.profile.min_soil
     max_soil = state.zone_cfg.profile.max_soil
     stop_target = midpoint(min_soil, max_soil)
+    
+    # Debug info
+    _warn("auto_state_debug", f"[DEBUG] run_auto_logic: soil={soil} min={min_soil} target={stop_target} trigger={state.active_trigger}")
 
     # schedule handling moved to `run_schedule_logic()` called from main loop
 
+    # If user manually stopped a PROFILE irrigation before midpoint, do not
+    # restart PROFILE just because soil is still below min. Resume only after
+    # soil has recovered to midpoint or above.
+    if state.profile_cancelled_until_recovery:
+        if soil >= stop_target:
+            state.profile_cancelled_until_recovery = False
+            print(f"[PROFILE] Soil recovered to midpoint {stop_target}%, PROFILE auto can run again")
+        else:
+            _warn(
+                "profile_cancelled_until_recovery",
+                f"[PROFILE] Auto start cancelled by manual OFF until soil reaches midpoint "
+                f"{stop_target}% (soil={soil}%)",
+            )
+            return
+
     if soil <= min_soil and not state.pump_is_on:
+        now_ts = time.time()
+        if now_ts < state.manual_suppress_auto_until:
+            wait_sec = int(state.manual_suppress_auto_until - now_ts)
+            _warn("auto_suppressed", f"[PROFILE] Soil low ({soil} <= {min_soil}) but AUTO suppressed for {wait_sec}s more")
+            return
         start_irrigation("PROFILE")
 
     # Stop PROFILE irrigation as soon as soil reaches the profile max threshold.
-    # Defaults are intentionally immediate now: PROFILE_MIN_RUN_SEC=0 and STOP_HYSTERESIS_COUNT=1.
+    # We now IGNORE profile_min_end_at to ensure strict adherence to midpoint target.
     if state.pump_is_on and state.active_trigger == "PROFILE":
-        now_ts = time.time()
-        min_end = state.profile_min_end_at or 0
-        if now_ts >= min_end:
-            if soil >= stop_target:
-                state.stop_above_count = state.stop_above_count + 1
-                try:
-                    print(f"[DEBUG] PROFILE stop check {state.stop_above_count}/{STOP_HYSTERESIS_COUNT} (soil={soil} max={stop_target})")
-                except Exception:
-                    pass
-                if state.stop_above_count >= STOP_HYSTERESIS_COUNT:
-                    stop_irrigation(f"soil reached profile max threshold {stop_target}%")
-            else:
-                state.stop_above_count = 0
+        if soil >= stop_target:
+            state.stop_above_count = state.stop_above_count + 1
+            print(f"[DEBUG] PROFILE stop check {state.stop_above_count}/{STOP_HYSTERESIS_COUNT} (soil={soil} target={stop_target} trigger={state.active_trigger})")
+            if state.stop_above_count >= STOP_HYSTERESIS_COUNT:
+                state.profile_cancelled_until_recovery = False
+                stop_irrigation(f"soil reached profile midpoint threshold {stop_target}%")
+        else:
+            if state.stop_above_count > 0:
+                print(f"[DEBUG] PROFILE stop check reset (soil={soil} < target={stop_target})")
+            state.stop_above_count = 0
 
-    # Only stop DEVICE-initiated irrigation based on soil threshold.
+    # Only stop DEVICE-initiated or orphaned irrigation based on soil threshold.
     # MANUAL, AI, and gateway-owned triggers have their own stop conditions.
-    if state.pump_is_on and state.active_trigger == "DEVICE" and soil >= stop_target:
-        stop_irrigation(f"DEVICE irrigation: soil reached stop target {stop_target}%")
+    if state.pump_is_on and (state.active_trigger == "DEVICE" or state.active_trigger is None) and soil >= stop_target:
+        stop_irrigation(f"DEVICE/orphaned irrigation: soil reached stop target {stop_target}%")
 
     # In AUTO mode, let soil safety override a scheduled irrigation if the soil is already wet enough.
-    if state.pump_is_on and state.active_trigger == "SCHEDULE":
-        if soil >= max_soil:
-            print(f"[AUTO OVERRIDE] soil={soil} >= max={max_soil}; stopping scheduled irrigation")
-            stop_irrigation(f"auto override: soil reached profile max threshold {max_soil}%")
-            return
+    # (Removed per user request: schedule must run for its full duration regardless of soil)
 
     if (
         state.pump_is_on
@@ -1382,7 +1558,8 @@ def run_schedule_logic():
         )
         # Start irrigation FIRST so pump turns on with minimum delay,
         # then publish the audit log (HTTP) without blocking the pump start.
-        start_irrigation("SCHEDULE", dur_sec, started_ts=scheduled_ts, effective_priority=effective_priority)
+        # Use time.time() as started_ts to ensure the schedule runs for the full duration from actual start.
+        start_irrigation("SCHEDULE", dur_sec, started_ts=time.time(), effective_priority=effective_priority)
         try:
             publish_audit_log(
                 zone_id=state.zone_cfg.zone_id,
@@ -1402,7 +1579,7 @@ def run_schedule_logic():
         print("run_schedule_logic error:", exc)
 
 # ==========================================================
-# SERIAL
+# 9. TELEMETRY PROCESSING
 # ==========================================================
 def parse_serial_line(line: str) -> Optional[Dict[str, Any]]:
     # extract the first telemetry segment that looks like '!...#' in case the
@@ -1412,7 +1589,7 @@ def parse_serial_line(line: str) -> Optional[Dict[str, Any]]:
         return None
 
     seg = m.group(1)
-    print("RAW:", seg)
+    # print("RAW:", seg)  # suppressed repetitive debug
     cleaned = seg.lstrip("!").rstrip("#")
     parts = cleaned.split(";")
     data: Dict[str, Any] = {}
@@ -1742,13 +1919,36 @@ def handle_device_event(parsed: Dict[str, Any]) -> None:
         print("Handle device event error:", exc)
 
 
-def apply_parsed_telemetry(parsed: Dict[str, Any], prev_pump_state: bool) -> bool:
+def apply_parsed_telemetry(data: Dict[str, Any], prev_pump_state: bool) -> bool:
+    """Apply sensor data to state and handle hardware-level alerts."""
+    if state.latest_data is None:
+        state.latest_data = {}
+    
+    state.latest_data.update(data)
+    state.last_telemetry_time = time.time()
+
+    # Mark each device as seen
+    for key in data:
+        if key in DEVICE_KEYS:
+            state.mark_device_seen(key)
+    
+    # --- Check for Sensor Errors (e.g. disconnected) ---
+    soil_raw = safe_int(data.get("RAW"), -1)
+    if soil_raw == 0 or soil_raw >= 4090:
+         _warn(
+            "sensor_error",
+            f"Sensor error detected: RAW={soil_raw}. Check wiring for device {state.zone_cfg.zone_name}",
+            publish_api=True,
+            severity="ERROR",
+            alert_type="DEVICE_STATUS"
+        )
+
     telemetry_updated = False
 
     if state.latest_data is None:
         state.latest_data = {}
 
-    for k, v in parsed.items():
+    for k, v in data.items():
         state.latest_data[k] = v
         if k in DEVICE_KEYS:
             try:
@@ -1756,15 +1956,15 @@ def apply_parsed_telemetry(parsed: Dict[str, Any], prev_pump_state: bool) -> boo
             except Exception:
                 pass
 
-    if "PUMP" in parsed:
-        state.pump_is_on = parsed["PUMP"] == 1
-        if state.pending_manual_state is not None and int(parsed["PUMP"]) == int(state.pending_manual_state):
+    if "PUMP" in data:
+        state.pump_is_on = data["PUMP"] == 1
+        if state.pending_manual_state is not None and int(data["PUMP"]) == int(state.pending_manual_state):
             state.pending_manual_state = None
         telemetry_updated = True
 
     try:
-        if "RAW" in parsed and COMPUTE_SOIL_FROM_RAW:
-            raw_val = int(parsed.get("RAW") or 0)
+        if "RAW" in data and COMPUTE_SOIL_FROM_RAW:
+            raw_val = int(data.get("RAW") or 0)
             if SOIL_RAW_WET != SOIL_RAW_DRY:
                 pct = int(round((raw_val - SOIL_RAW_DRY) * 100.0 / (SOIL_RAW_WET - SOIL_RAW_DRY)))
                 if pct < 0:
@@ -1773,22 +1973,22 @@ def apply_parsed_telemetry(parsed: Dict[str, Any], prev_pump_state: bool) -> boo
                     pct = 100
                 state.latest_data["SOIL"] = pct
                 telemetry_updated = True
-                print(f"[DEBUG] Computed SOIL from RAW: {raw_val} -> {pct} (dry={SOIL_RAW_DRY},wet={SOIL_RAW_WET})")
+                # print(f"[DEBUG] Computed SOIL from RAW: {raw_val} -> {pct} (dry={SOIL_RAW_DRY},wet={SOIL_RAW_WET})")
     except Exception:
         pass
 
-    if "EVENT_TYPE" in parsed:
-        handle_device_event(parsed)
+    if "EVENT_TYPE" in data:
+        handle_device_event(data)
 
     try:
-        if "PUMP" in parsed:
-            new_pump = parsed.get("PUMP") == 1
-            if prev_pump_state and (not new_pump) and not (parsed.get("EVENT_TYPE") == "STOP"):
+        if "PUMP" in data:
+            new_pump = data.get("PUMP") == 1
+            if prev_pump_state and (not new_pump) and not (data.get("EVENT_TYPE") == "STOP"):
                 now_ts = time.time()
                 if state.suppress_device_audit or now_ts < (state.ignore_pump_off_until or 0):
                     print("[DEBUG] Ignoring pump telemetry OFF due to gateway-initiated irrigation (suppression active or within grace window)")
                 else:
-                    start_ts = parsed.get("EVENT_START_TS") or state.current_watering_started_at
+                    start_ts = data.get("EVENT_START_TS") or state.current_watering_started_at
                     try:
                         stop_irrigation("pump telemetry off", started_ts=start_ts)
                     except Exception as exc:
@@ -1796,7 +1996,7 @@ def apply_parsed_telemetry(parsed: Dict[str, Any], prev_pump_state: bool) -> boo
     except Exception:
         pass
 
-    if any(k in parsed for k in ("TEMP", "HUMI", "SOIL", "RAW", "PUMP")):
+    if any(k in data for k in ("TEMP", "HUMI", "SOIL", "RAW", "PUMP")):
         telemetry_updated = True
 
     if telemetry_updated:
@@ -1810,80 +2010,102 @@ def apply_parsed_telemetry(parsed: Dict[str, Any], prev_pump_state: bool) -> boo
     return telemetry_updated
 
 
-while True:
+# ==========================================================
+# 10. MAIN CONTROL LOOP (EXECUTION)
+# ==========================================================
 
-    latest_parsed_telemetry: Optional[Dict[str, Any]] = None
-    latest_prev_pump_state = state.pump_is_on
+if __name__ == "__main__":
+    print("Gateway started...")
+    
+    # 1. Initial configuration fetch from Database (forced)
+    try:
+        refresh_zone_config(force=True)
+    except Exception as exc:
+        print("Initial config fetch failed:", exc)
 
-    while ser.in_waiting > 0:
-        prev_pump_state_for_line = state.pump_is_on
-        line = ser.readline().decode(errors="ignore").strip()
-        if not line:
-            continue
+    # 2. Start-up process
+    device_names = []
+    for dtype in state.device_ids.keys():
+        friendly = DEVICE_FRIENDLY.get(dtype, dtype)
+        device_names.append(friendly)
 
-        parsed = parse_serial_line(line)
-        if parsed is None:
-            continue
+    # Final Gateway summary log
+    names_str = ", ".join([n.lower().replace(" sensor", "").replace("irrigation ", "") for n in device_names])
+    publish_audit_log(
+        zone_id=state.zone_cfg.zone_id,
+        zone_name=state.zone_cfg.zone_name,
+        severity="INFO",
+        alert_type="DEVICE_STATUS",
+        actor="SYSTEM",
+        message=f"{names_str} + {len(state.device_ids)} device(s) + Online"
+    )
 
-        if "EVENT_TYPE" in parsed:
-            apply_parsed_telemetry(parsed, prev_pump_state_for_line)
-            continue
+    # 2. Main Loop
+    while True:
+        now_ts = time.time()
+        
+        # --- HIGHEST PRIORITY: Stop active timed irrigation (Schedule/AI) ---
+        if state.pump_is_on and state.current_schedule_end_at is not None:
+            if now_ts >= state.current_schedule_end_at:
+                stop_irrigation(f"timer expired (duration reached at {hms_now()})")
 
-        if any(k in parsed for k in ("TEMP", "HUMI", "SOIL", "RAW", "PUMP")):
-            latest_parsed_telemetry = parsed
-            latest_prev_pump_state = prev_pump_state_for_line
+        # Log current time for monitoring (rate limited)
+        _warn("loop_time", f"[SYSTEM] Local Time: {hhmm_now()} | Epoch: {int(now_ts)}")
 
-    if latest_parsed_telemetry is not None:
-        telemetry_changed = apply_parsed_telemetry(latest_parsed_telemetry, latest_prev_pump_state)
-        if telemetry_changed:
+        latest_parsed_telemetry: Optional[Dict[str, Any]] = None
+        latest_prev_pump_state = state.pump_is_on
+
+        while ser.in_waiting > 0:
+            prev_pump_state_for_line = state.pump_is_on
+            line = ser.readline().decode(errors="ignore").strip()
+            if not line:
+                continue
+
+            parsed = parse_serial_line(line)
+            if parsed is None:
+                continue
+
+            if "EVENT_TYPE" in parsed:
+                apply_parsed_telemetry(parsed, prev_pump_state_for_line)
+                continue
+
+            if any(k in parsed for k in ("TEMP", "HUMI", "SOIL", "RAW", "PUMP")):
+                latest_parsed_telemetry = parsed
+                latest_prev_pump_state = prev_pump_state_for_line
+
+        if latest_parsed_telemetry is not None:
+            apply_parsed_telemetry(latest_parsed_telemetry, latest_prev_pump_state)
+
+        process_device_status()
+
+        try:
+            # 2. Run Manual Control Logic
+            run_manual_logic()
+
+            mode = state.zone_cfg.profile.mode
+            if mode == "AUTO":
+                if state.active_trigger != "MANUAL":
+                    run_auto_logic()
+            elif mode == "AI":
+                if state.active_trigger != "MANUAL":
+                    run_ai_logic()
+
+            # 4. Run Schedule Logic
+            run_schedule_logic()
+
+            # 5. Config Refresh
+            if now_ts - state.last_config_refresh >= CONFIG_REFRESH_SEC:
+                should_force = now_ts - state.last_config_refresh >= (CONFIG_REFRESH_SEC * 5)
+                if state.active_trigger is None or should_force:
+                    refresh_zone_config()
+
+            # 6. Periodic Adafruit Sync
             send_to_adafruit_if_due()
 
-    process_device_status()
+            # 7. Plant Alerts
+            process_plant_alerts()
 
-    try:
-        run_schedule_logic()
-    except Exception:
-        pass
+        except Exception as exc:
+            print("Main loop execution error:", exc)
 
-    # Manual control always runs first — highest priority, overrides all modes.
-    run_manual_logic()
-
-    mode = state.zone_cfg.profile.mode
-    if mode == "AUTO":
-        # Only run auto logic if pump is not already under manual control
-        if state.active_trigger != "MANUAL":
-            run_auto_logic()
-    elif mode == "AI":
-        # Only run AI logic if pump is not already under manual control
-        if state.active_trigger != "MANUAL":
-            run_ai_logic()
-
-    try:
-        if (
-            state.pump_is_on
-            and state.active_trigger in ("SCHEDULE", "AI")
-            and state.current_schedule_end_at is not None
-            and time.time() >= state.current_schedule_end_at
-        ):
-            trigger_actor = "AI" if state.active_trigger == "AI" else "SYSTEM"
-            stop_irrigation(
-                f"{state.active_trigger.lower()} duration completed (gateway timer)",
-                actor=trigger_actor,
-            )
-    except Exception:
-        pass
-
-    # Config refresh strategy:
-    # • SCHEDULE: skip during active irrigation (duration-based, no live thresholds needed);
-    #             force every 5× interval so deletions propagate.
-    # • PROFILE:  refresh every CONFIG_REFRESH_SEC normally so web min/max changes
-    #             propagate within one cycle (soil-based stop needs current thresholds).
-    # • All others: refresh at normal rate.
-    if state.pump_is_on and state.active_trigger == "SCHEDULE":
-        if time.time() - state.last_config_refresh > CONFIG_REFRESH_SEC * 5:
-            refresh_zone_config()  # emergency refresh only
-    else:
-        refresh_zone_config()  # normal rate for PROFILE, MANUAL, idle
-
-    send_to_adafruit_if_due()
-    time.sleep(0.02)
+        time.sleep(0.02)
